@@ -541,6 +541,130 @@ else
 	no "a truncated or mutated core crashed, hung, or was not diagnosed"
 fi
 
+# -- synthesised fixtures: absent memory, PN_XNUM, note name padding -------
+# gcore emits none of these three shapes, so they are built by rewriting a
+# valid core. Each one is a real thing a real core reader meets:
+#   core.filesz0  file-backed read-only PT_LOADs with p_filesz = 0, which is
+#                 what the kernel's default coredump_filter (0x33) produces
+#                 for every shared library's text in every kernel core.
+#   core.xnum     e_phnum = PN_XNUM, the >65534 mappings encoding.
+#   core.pad      notes whose name lengths run 1..8 bytes, so the 4-byte name
+#                 padding is exercised at every residue, with real CORE notes
+#                 interleaved so a desync is visible in the register dump.
+rm -f $S/core.filesz0 $S/core.xnum $S/core.pad
+zeroed=$(python3 - $S/core.seg $S <<'PY'
+import struct, sys
+
+core, outdir = sys.argv[1], sys.argv[2]
+b = bytearray(open(core, 'rb').read())
+phoff, = struct.unpack_from('<Q', b, 0x20)
+psz, pn = struct.unpack_from('<HH', b, 0x36)
+ph = [list(struct.unpack_from('<IIQQQQQQ', b, phoff + i * psz)) for i in range(pn)]
+
+# --- fixture 1: file-backed read-only PT_LOADs with p_filesz = 0, which is
+# what the kernel's default coredump_filter produces.
+f = bytearray(b)
+zeroed = 0
+for i, s in enumerate(ph):
+    if s[0] == 1 and not (s[1] & 2) and s[5]:      # PT_LOAD, not writable
+        struct.pack_into('<Q', f, phoff + i * psz + 32, 0)
+        zeroed += 1
+open(outdir + '/core.filesz0', 'wb').write(f)
+
+# --- fixture 2: PN_XNUM. e_phnum = 0xffff, real count in shdr[0].sh_info.
+x = bytearray(b)
+shoff = len(x)
+sh = bytearray(64)
+struct.pack_into('<I', sh, 44, pn)                 # sh_info
+x += sh
+struct.pack_into('<Q', x, 0x28, shoff)             # e_shoff
+struct.pack_into('<H', x, 0x3a, 64)                # e_shentsize
+struct.pack_into('<H', x, 0x3c, 1)                 # e_shnum
+struct.pack_into('<H', x, 0x38, 0xffff)            # e_phnum
+open(outdir + '/core.xnum', 'wb').write(x)
+
+# --- fixture 3: a core built from scratch whose PT_NOTE carries notes with
+# every possible name length mod 4, to pin the name padding rule.
+notes = []
+for s in ph:
+    if s[0] != 4:
+        continue
+    p, end = s[2], s[2] + s[5]
+    while p + 12 <= end:
+        nsz, dsz, ty = struct.unpack_from('<III', b, p)
+        d = p + 12 + ((nsz + 3) & ~3)
+        notes.append((bytes(b[p + 12:p + 12 + nsz]), ty, bytes(b[d:d + dsz])))
+        p = d + ((dsz + 3) & ~3)
+
+def enc(name, ty, desc):
+    out = struct.pack('<III', len(name), len(desc), ty) + name
+    out += b'\0' * (-len(out) % 4)
+    out += desc + b'\0' * (-len(desc) % 4)
+    return out
+
+blob = b''
+for i, n in enumerate(notes):
+    # a dummy note with a name of length 1..8 before each real one
+    nm = bytes('PAD%d' % i, 'ascii')[:1 + (i % 8)]
+    blob += enc(nm, 0x1000 + i, bytes([i]) * (i % 5))
+    blob += enc(*n)
+
+ehdr = bytearray(64)
+ehdr[0:16] = b'\x7fELF\x02\x01\x01' + b'\0' * 9
+struct.pack_into('<HHI', ehdr, 16, 4, 62, 1)       # ET_CORE, EM_X86_64
+struct.pack_into('<Q', ehdr, 0x20, 64)             # e_phoff
+struct.pack_into('<HHH', ehdr, 0x34, 64, 56, 2)    # ehsize, phentsize, phnum
+noff = 64 + 2 * 56
+body = bytes(blob)
+loadoff = noff + len(body)
+out = bytes(ehdr)
+out += struct.pack('<IIQQQQQQ', 4, 4, noff, 0, 0, len(body), 0, 1)
+out += struct.pack('<IIQQQQQQ', 1, 6, loadoff, 0x40000000, 0, 4096, 4096, 4096)
+out += body + bytes(4096)
+open(outdir + '/core.pad', 'wb').write(out)
+print(zeroed)
+PY
+)
+[ -n "$zeroed" ] || { no "could not build the synthesised fixtures"; exit 1; }
+
+got=$($COREX --maps $S/core.filesz0 | grep -c ' absent ')
+chk "core.filesz0: $zeroed read-only mappings are reported absent, not as zeros" "$got" "$zeroed"
+gdbb $S/seg $S/core.filesz0 -ex 'maint info sections' 2>&1 | grep -E 'load[0-9]+' |
+	awk '{ sub("->"," ",$2); c="absent"; ro="rw"; x="-"
+	       for (i=1; i<=NF; i++) { if ($i=="HAS_CONTENTS") c="present"
+	                               if ($i=="READONLY") ro="r-"
+	                               if ($i=="CODE") x="x" }
+	       print $2, c, ro x }' | nz | sort > $S/gdb.maps0
+$COREX --maps $S/core.filesz0 |
+	awk '{ st=$9; if (st=="partial") st="present"; print $2, $3, st, $4 }' | nz | sort > $S/cx.maps0
+cmp -s $S/gdb.maps0 $S/cx.maps0 && ok "core.filesz0: gdb agrees which mappings have no contents" || {
+	no "core.filesz0: disagrees with gdb on which mappings are absent"
+	diff $S/gdb.maps0 $S/cx.maps0 | head -4; }
+rip=$($COREX --regs $S/core.filesz0 | awk '$2=="rip"{print $3}')
+$COREX -x $rip,16 $S/core.filesz0 >$S/out 2>&1; rc=$?
+chk "core.filesz0: reading absent memory fails instead of returning zeros" "$rc" "1"
+grep -q absent $S/out && ok "and says the mapping is present but its contents are not" || {
+	no "no 'absent' diagnostic"; head -2 $S/out; }
+bt_cx $S/core.filesz0 1 > $S/cx.bt0
+cmp -s $S/cx.bt $S/cx.bt0 && ok "core.filesz0: the backtrace is unaffected -- the stack is still stored" || {
+	no "core.filesz0: backtrace changed"; diff $S/cx.bt $S/cx.bt0; }
+
+want=$(readelf -lW $S/core.xnum | sed -n 's/^There are \([0-9]*\) program headers.*/\1/p')
+got=$($COREX --phdrs $S/core.xnum | sed -n 's/^core:.* \([0-9]*\) program headers.*/\1/p')
+chk "core.xnum: PN_XNUM phdr count read from shdr[0].sh_info, agrees with readelf ($want)" "$got" "$want"
+
+readelf -n $S/core.pad | awk '/^  [A-Za-z]/ && $2 ~ /^0x/ {print $1, $2}' | nz > $S/re.pad
+$COREX --notes $S/core.pad | awk '{print $2, $3}' | nz > $S/cx.pad
+if cmp -s $S/re.pad $S/cx.pad; then
+	ok "core.pad: all $(wc -l <$S/cx.pad | tr -d ' ') notes agree with readelf across name lengths 1..8"
+else
+	no "core.pad: note list disagrees with readelf"; diff $S/re.pad $S/cx.pad | head -6
+fi
+$COREX --regs $S/core.pad > $S/cx.padregs
+$COREX --regs $S/core.seg > $S/cx.segregs
+cmp -s $S/cx.padregs $S/cx.segregs && ok "core.pad: the registers are still the original core's, so the iterator did not desync" || {
+	no "core.pad: register dump changed"; diff $S/cx.padregs $S/cx.segregs | head -4; }
+
 # -- rejecting what is not a core ------------------------------------------
 $COREX corex.c >/dev/null 2>$S/err; rc=$?
 chk "a C source file is rejected (exit 1)" "$rc" "1"
