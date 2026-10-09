@@ -72,6 +72,68 @@ chk "pid agrees with gdb ($want)" "$got" "$want"
 got=$($COREX --proc $S/core.seg | sed -n 's/^cmd: //p')
 chk "pr_fname is the program name" "$got" "seg"
 
+# -- NT_PRSTATUS: registers, against gdb ----------------------------------
+# Every general-purpose register, by value, against an independent reader of
+# the same bytes. A register gdb disagrees with is conclusively wrong.
+regs_of_gdb() {  # regs_of_gdb CORE BIN [thread-cmd]
+	gdbb "$2" "$1" -ex "${3:-info registers}" -ex 'info registers orig_rax' 2>&1 |
+		awk '$1 ~ /^[a-z_0-9]+$/ && $2 ~ /^0x/ {print $1, $2}' | nz | sort
+}
+regs_of_gdb $S/core.seg $S/seg > $S/gdb.regs
+$COREX --regs $S/core.seg | awk '$1=="reg"{print $2, $3}' | nz | sort > $S/cx.regs
+n=$(wc -l <$S/gdb.regs | tr -d ' ')
+if [ "$n" -eq 27 ] && cmp -s $S/gdb.regs $S/cx.regs; then
+	ok "all $n registers agree with gdb, by value"
+else
+	no "registers disagree with gdb ($n from gdb)"; diff $S/gdb.regs $S/cx.regs | head
+fi
+
+# The comparator must be able to fail. Flip one nibble of rip in a copy of the
+# core and confirm the register check notices: a suite that cannot fail is the
+# most expensive kind of green.
+cp $S/core.seg $S/core.tamper
+off=$(python3 - $S/core.tamper <<'PY'
+import struct, sys
+b = bytearray(open(sys.argv[1], 'rb').read())
+phoff, = struct.unpack_from('<Q', b, 0x20)
+ps, pn = struct.unpack_from('<HH', b, 0x36)
+for i in range(pn):
+	t, fl, off, va, pa, fsz, msz, al = struct.unpack_from('<IIQQQQQQ', b, phoff + i * ps)
+	if t != 4:
+		continue
+	p = off
+	end = off + fsz
+	while p + 12 <= end:
+		nsz, dsz, ty = struct.unpack_from('<III', b, p)
+		desc = p + 12 + ((nsz + 3) & ~3)
+		if ty == 1:                 # NT_PRSTATUS: pr_reg[16] is rip
+			b[desc + 112 + 16 * 8] ^= 0x10
+			open(sys.argv[1], 'wb').write(b)
+			print(desc)
+			sys.exit()
+		p = desc + ((dsz + 3) & ~3)
+PY
+)
+[ -n "$off" ] || no "tamper helper found no NT_PRSTATUS"
+$COREX --regs $S/core.tamper | awk '$1=="reg"{print $2, $3}' | nz | sort > $S/cx.tamper
+if cmp -s $S/gdb.regs $S/cx.tamper; then
+	no "meta: register comparator did not notice a flipped bit in rip"
+else
+	ok "meta: register comparator notices a flipped bit in rip"
+fi
+
+# -- the signal and the faulting address, against gdb ---------------------
+gdbb $S/seg $S/core.seg -ex 'p $_siginfo' >$S/gdb.sig 2>&1
+want=$(sed -n 's/^Program terminated with signal \([A-Z0-9]*\),.*/\1/p' $S/gdb.sig)
+got=$($COREX --signal $S/core.seg | sed -n 's/^signal: \([A-Z0-9]*\) .*/\1/p')
+chk "killing signal agrees with gdb ($want)" "$got" "$want"
+want=$(tr ',' '\n' <$S/gdb.sig | sed -n 's/.*si_code = \(-*[0-9]*\).*/\1/p' | head -1)
+got=$($COREX --signal $S/core.seg | sed -n 's/^signal: .* code \(-*[0-9]*\) .*/\1/p')
+chk "si_code agrees with gdb \$_siginfo ($want)" "$got" "$want"
+want=$(tr ',' '\n' <$S/gdb.sig | sed -n 's/.*_sigfault = {si_addr = \(0x[0-9a-f]*\).*/\1/p' | head -1)
+got=$($COREX --signal $S/core.seg | sed -n 's/^fault: address //p')
+chk "faulting address agrees with gdb \$_siginfo->si_addr ($want)" "$got" "$want"
+
 # -- rejecting what is not a core ------------------------------------------
 $COREX corex.c >/dev/null 2>$S/err; rc=$?
 chk "a C source file is rejected (exit 1)" "$rc" "1"

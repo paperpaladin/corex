@@ -339,28 +339,214 @@ static void show_prpsinfo(void)
 	put_fixed("psargs:", d + 56, 80);
 }
 
+/* ---- NT_PRSTATUS: registers, one note per thread -------------------------
+ *
+ * struct elf_prstatus, 336 bytes:
+ *
+ *   0  struct elf_siginfo pr_info  { int si_signo, si_code, si_errno; }
+ *   12 short pr_cursig            (then 2 bytes of padding)
+ *   16 unsigned long pr_sigpend
+ *   24 unsigned long pr_sighold
+ *   32 pid_t pr_pid, pr_ppid, pr_pgrp, pr_sid
+ *   48 struct timeval pr_utime, pr_stime, pr_cutime, pr_cstime  (4 x 16)
+ *   112 elf_gregset_t pr_reg      (27 x 8 = 216 bytes)
+ *   328 int pr_fpvalid
+ *
+ * pr_pid is really the *thread* id (the kernel writes task->pid, which is the
+ * tid); the thread-group id is NT_PRPSINFO's pr_pid. One NT_PRSTATUS per
+ * thread, in the order the kernel walked the thread list, with the thread
+ * that took the signal first.
+ */
+#define PRSTATUS_SZ	336
+#define NGREG		27
+
+struct thread {
+	int32_t pid, ppid, pgrp, sid;
+	int32_t cursig, si_signo, si_code, si_errno;
+	uint64_t reg[NGREG];
+};
+
+static struct thread *threads;
+static unsigned nthreads;
+
+/* pr_reg is a struct user_regs_struct, whose field order is neither
+ * alphabetical nor the DWARF register order. Index into it by name, in the
+ * order gdb's "info registers" prints, so the two dumps line up. */
+static const struct { const char *name; int i; } REGMAP[NGREG] = {
+	{ "rax", 10 }, { "rbx", 5 },  { "rcx", 11 }, { "rdx", 12 },
+	{ "rsi", 13 }, { "rdi", 14 }, { "rbp", 4 },  { "rsp", 19 },
+	{ "r8", 9 },   { "r9", 8 },   { "r10", 7 },  { "r11", 6 },
+	{ "r12", 3 },  { "r13", 2 },  { "r14", 1 },  { "r15", 0 },
+	{ "rip", 16 }, { "eflags", 18 }, { "cs", 17 }, { "ss", 20 },
+	{ "ds", 23 },  { "es", 24 },  { "fs", 25 },  { "gs", 26 },
+	{ "fs_base", 21 }, { "gs_base", 22 }, { "orig_rax", 15 },
+};
+
+static void load_threads(void)
+{
+	for (unsigned i = 0; i < nnotes; i++) {
+		if (notes[i].type != NT_PRSTATUS || !nameis(&notes[i], "CORE"))
+			continue;
+		if (notes[i].descsz < PRSTATUS_SZ)
+			die("NT_PRSTATUS note %u is %" PRIu64 " bytes, want %u",
+			    nthreads, notes[i].descsz, PRSTATUS_SZ);
+		threads = realloc(threads, (nthreads + 1) * sizeof *threads);
+		if (!threads)
+			die("out of memory");
+		struct thread *t = &threads[nthreads++];
+		const uint8_t *d = notes[i].desc;
+		t->si_signo = (int32_t)u32(d);
+		t->si_code = (int32_t)u32(d + 4);
+		t->si_errno = (int32_t)u32(d + 8);
+		t->cursig = (int16_t)u16(d + 12);
+		t->pid = (int32_t)u32(d + 32);
+		t->ppid = (int32_t)u32(d + 36);
+		t->pgrp = (int32_t)u32(d + 40);
+		t->sid = (int32_t)u32(d + 44);
+		for (int r = 0; r < NGREG; r++)
+			t->reg[r] = u64(d + 112 + 8 * r);
+	}
+	if (!nthreads)
+		die("no NT_PRSTATUS note: no thread state in this core");
+}
+
+static const char *signame(int s)
+{
+	static const char *n[] = {
+		NULL, "SIGHUP", "SIGINT", "SIGQUIT", "SIGILL", "SIGTRAP",
+		"SIGABRT", "SIGBUS", "SIGFPE", "SIGKILL", "SIGUSR1", "SIGSEGV",
+		"SIGUSR2", "SIGPIPE", "SIGALRM", "SIGTERM", "SIGSTKFLT",
+		"SIGCHLD", "SIGCONT", "SIGSTOP", "SIGTSTP", "SIGTTIN",
+		"SIGTTOU", "SIGURG", "SIGXCPU", "SIGXFSZ", "SIGVTALRM",
+		"SIGPROF", "SIGWINCH", "SIGIO", "SIGPWR", "SIGSYS",
+	};
+	return (s > 0 && s < (int)(sizeof n / sizeof *n)) ? n[s] : "?";
+}
+
+/* si_code is interpreted relative to si_signo for the fault signals, and
+ * absolutely for the rest (negative codes mean a sender, not a fault). */
+static const char *sigcode(int signo, int code)
+{
+	switch (code) {
+	case 0:    return "SI_USER";
+	case 0x80: return "SI_KERNEL";
+	case -1:   return "SI_QUEUE";
+	case -2:   return "SI_TIMER";
+	case -3:   return "SI_MESGQ";
+	case -4:   return "SI_ASYNCIO";
+	case -5:   return "SI_SIGIO";
+	case -6:   return "SI_TKILL";
+	}
+	switch (signo) {
+	case 11: return code == 1 ? "SEGV_MAPERR" : code == 2 ? "SEGV_ACCERR" :
+			code == 3 ? "SEGV_BNDERR" : code == 4 ? "SEGV_PKUERR" : "?";
+	case 7:  return code == 1 ? "BUS_ADRALN" : code == 2 ? "BUS_ADRERR" :
+			code == 3 ? "BUS_OBJERR" : "?";
+	case 4:  return code == 1 ? "ILL_ILLOPC" : code == 2 ? "ILL_ILLOPN" :
+			code == 3 ? "ILL_ILLADR" : code == 4 ? "ILL_ILLTRP" :
+			code == 5 ? "ILL_PRVOPC" : code == 8 ? "ILL_BADSTK" : "?";
+	case 8:  return code == 1 ? "FPE_INTDIV" : code == 2 ? "FPE_INTOVF" :
+			code == 3 ? "FPE_FLTDIV" : code == 4 ? "FPE_FLTOVF" :
+			code == 5 ? "FPE_FLTUND" : code == 6 ? "FPE_FLTRES" :
+			code == 7 ? "FPE_FLTINV" : code == 8 ? "FPE_FLTSUB" : "?";
+	case 5:  return code == 1 ? "TRAP_BRKPT" : code == 2 ? "TRAP_TRACE" : "?";
+	}
+	return "?";
+}
+
+/* True for the signals whose siginfo carries a faulting address. */
+static int has_fault_addr(int s)
+{
+	return s == 4 || s == 5 || s == 7 || s == 8 || s == 11;
+}
+
+/* The thread that took the signal: the one with a non-zero pr_cursig. */
+static const struct thread *killed_thread(void)
+{
+	for (unsigned i = 0; i < nthreads; i++)
+		if (threads[i].cursig)
+			return &threads[i];
+	return &threads[0];
+}
+
+/* NT_SIGINFO is the kernel's siginfo_t as written to the core:
+ *   0 si_signo, 4 si_errno, 8 si_code, 16 the union.
+ * Note the field order differs from elf_siginfo in NT_PRSTATUS, which is
+ * si_signo, si_code, si_errno. Mixing the two up swaps code and errno, and
+ * since errno is almost always 0 the result looks like code 0 == SI_USER:
+ * a NULL dereference reported as "someone sent you a signal".
+ */
+static void show_signal(void)
+{
+	const struct thread *t = killed_thread();
+	const struct note *n = find_note(NT_SIGINFO, 0);
+	int signo = t->cursig, code = t->si_code;
+	const uint8_t *d = NULL;
+
+	if (n && n->descsz >= 24) {
+		d = n->desc;
+		signo = (int32_t)u32(d);
+		code = (int32_t)u32(d + 8);
+	}
+	if (!signo) {
+		printf("signal: none (this core was not made by a fatal signal)\n");
+		return;
+	}
+	printf("signal: %s (%d) code %d (%s) thread %" PRId32 "\n",
+	       signame(signo), signo, code, sigcode(signo, code), t->pid);
+	if (!d) {
+		printf("fault: unknown (no NT_SIGINFO note in this core)\n");
+	} else if (has_fault_addr(signo) && code > 0) {
+		printf("fault: address 0x%" PRIx64 "\n", u64(d + 16));
+	} else if (code <= 0 || code == 0x80) {
+		printf("fault: sent by pid %" PRId32 " uid %" PRIu32 "\n",
+		       (int32_t)u32(d + 16), u32(d + 20));
+	}
+}
+
+static void show_threads(int regs)
+{
+	printf("threads: %u\n", nthreads);
+	for (unsigned i = 0; i < nthreads; i++) {
+		const struct thread *t = &threads[i];
+		printf("thread %u tid %" PRId32 " cursig %" PRId32 " (%s)\n",
+		       i + 1, t->pid, t->cursig,
+		       t->cursig ? signame(t->cursig) : "none");
+		if (!regs)
+			continue;
+		for (int r = 0; r < NGREG; r++)
+			printf("reg %s 0x%" PRIx64 "\n", REGMAP[r].name,
+			       t->reg[REGMAP[r].i]);
+	}
+}
+
 /* ---- main --------------------------------------------------------------- */
 
 static void usage(void)
 {
-	fputs("usage: corex [--phdrs] [--notes] [--proc] CORE\n", stderr);
+	fputs("usage: corex [--phdrs] [--notes] [--proc] [--signal] [--threads]\n             [--regs] CORE\n", stderr);
 	exit(2);
 }
 
 int main(int argc, char **argv)
 {
-	int want_phdrs = 0, want_notes = 0, want_proc = 0, any = 0;
+	int want_phdrs = 0, want_notes = 0, want_proc = 0;
+	int want_sig = 0, want_threads = 0, want_regs = 0, any = 0;
 
 	for (int i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "--phdrs")) { want_phdrs = any = 1; }
 		else if (!strcmp(argv[i], "--notes")) { want_notes = any = 1; }
 		else if (!strcmp(argv[i], "--proc")) { want_proc = any = 1; }
+		else if (!strcmp(argv[i], "--signal")) { want_sig = any = 1; }
+		else if (!strcmp(argv[i], "--threads")) { want_threads = any = 1; }
+		else if (!strcmp(argv[i], "--regs")) { want_regs = want_threads = any = 1; }
 		else if (argv[i][0] == '-' && argv[i][1]) usage();
 		else if (cpath) usage();
 		else cpath = argv[i];
 	}
 	if (!cpath) usage();
-	if (!any) want_phdrs = want_notes = want_proc = 1;
+	if (!any) want_phdrs = want_notes = want_proc = want_sig =
+			want_threads = want_regs = 1;
 
 	int fd = open(cpath, O_RDONLY);
 	if (fd < 0) { perror(cpath); return 3; }
@@ -376,11 +562,16 @@ int main(int argc, char **argv)
 
 	load_phdrs();
 	load_notes();
+	load_threads();
 	if (want_phdrs)
 		show_segs();
 	if (want_notes)
 		show_notes();
 	if (want_proc)
 		show_prpsinfo();
+	if (want_sig)
+		show_signal();
+	if (want_threads)
+		show_threads(want_regs);
 	return 0;
 }
