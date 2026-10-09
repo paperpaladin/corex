@@ -242,6 +242,59 @@ else
 	no "NT_FILE disagrees with gdb"; diff $S/gdb.files $S/cx.files | head -6
 fi
 
+# -- the PT_LOAD map, against gdb's view of the same segments ---------------
+# "maint info sections" on a core lists one BFD section per PT_LOAD with its
+# address range, its file offset and whether it HAS_CONTENTS, which is
+# p_filesz != 0. READONLY and CODE are gdb's reading of p_flags.
+gdbb $S/seg $S/core.seg -ex 'maint info sections' 2>&1 | grep -E 'load[0-9]+' |
+	awk '{ sub("->"," ",$2); c="absent"; ro="rw"; x="-"
+	       for (i=1; i<=NF; i++) { if ($i=="HAS_CONTENTS") c="present"
+	                               if ($i=="READONLY") ro="r-"
+	                               if ($i=="CODE") x="x" }
+	       print $2, c, ro x }' | nz | sort > $S/gdb.maps
+$COREX --maps $S/core.seg |
+	awk '{ st=$9; if (st=="partial") st="present"; print $2, $3, st, $4 }' |
+	nz | sort > $S/cx.maps
+if cmp -s $S/gdb.maps $S/cx.maps; then
+	ok "all $(wc -l <$S/cx.maps | tr -d ' ') PT_LOAD mappings agree with gdb: range, permissions, contents present"
+else
+	no "PT_LOAD map disagrees with gdb"; diff $S/gdb.maps $S/cx.maps | head -6
+fi
+
+# -- reading memory out of a PT_LOAD ---------------------------------------
+# t/buf.c plants 64 KiB of known bytes on its stack and prints the address.
+# The expected contents come from the source; gdb is asked for the same bytes
+# as a second opinion.
+gen buf || exit 1
+addr=$(sed -n 's/^buf \(0x[0-9a-f]*\) .*/\1/p' $S/gen.buf.log)
+if [ -z "$addr" ]; then
+	no "t/buf.c did not report its buffer address"
+else
+	ok "gcore: wrote a core for t/buf.c, buffer at $addr"
+	$COREX -x $addr,256 $S/core.buf | awk '{for (i=3; i<=NF && $i ~ /^[0-9a-f][0-9a-f]$/; i++) print $i}' > $S/cx.bytes
+	python3 -c 'print("\n".join("%02x" % ((i*31+7) & 255) for i in range(256)))' > $S/src.bytes
+	cmp -s $S/src.bytes $S/cx.bytes && ok "256 bytes read out of the stack segment are the bytes t/buf.c wrote" || {
+		no "stack buffer contents are not what the source wrote"; diff $S/src.bytes $S/cx.bytes | head -4; }
+	gdbb $S/buf $S/core.buf -ex "x/256xb $addr" 2>&1 |
+		awk -F: '/^0x/{print $2}' | tr -s ' \t' '\n' | sed '/^$/d;s/^0x//' > $S/gdb.bytes
+	cmp -s $S/gdb.bytes $S/cx.bytes && ok "...and are byte-identical to what gdb reads from the same core" || {
+		no "stack bytes disagree with gdb"; diff $S/gdb.bytes $S/cx.bytes | head -4; }
+	got=$($COREX --maps $S/core.buf | python3 -c '
+import sys
+a = int(sys.argv[1], 16)
+for l in sys.stdin:
+	f = l.split()
+	if f[0] == "map" and int(f[1], 16) <= a < int(f[2], 16):
+		print(f[3], f[8])
+' $addr)
+	chk "the mapping that holds the buffer is rw- and present" "$got" "rw- present"
+fi
+
+# An address no PT_LOAD covers is an error, not an empty dump.
+$COREX -x 0x1,16 $S/core.seg >$S/out 2>&1; rc=$?
+chk "reading an unmapped address fails (exit 1)" "$rc" "1"
+grep -q unmapped $S/out && ok "and says the address is unmapped" || no "no diagnostic for unmapped read"
+
 # -- rejecting what is not a core ------------------------------------------
 $COREX corex.c >/dev/null 2>$S/err; rc=$?
 chk "a C source file is rejected (exit 1)" "$rc" "1"

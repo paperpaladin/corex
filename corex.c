@@ -640,6 +640,15 @@ static void load_files(void)
 	nfmaps = count;
 }
 
+/* Which mapped file, if any, backs this address. */
+static const struct fmap *fmap_of(uint64_t addr)
+{
+	for (unsigned i = 0; i < nfmaps; i++)
+		if (addr >= fmaps[i].start && addr < fmaps[i].end)
+			return &fmaps[i];
+	return NULL;
+}
+
 static void show_files(void)
 {
 	if (!nfmaps) {
@@ -651,11 +660,107 @@ static void show_files(void)
 		       fmaps[i].start, fmaps[i].end, fmaps[i].off, fmaps[i].name);
 }
 
+/* ---- the PT_LOAD map, and reading memory out of it -----------------------
+ *
+ * Each PT_LOAD is one mapping of the dead process. p_memsz is how much
+ * address space it covered; p_filesz is how much of its contents the core
+ * actually stores. These differ, and the difference is not a corruption:
+ *
+ *   p_filesz == 0          the mapping existed and none of it was saved. The
+ *                          kernel's default /proc/PID/coredump_filter (0x33)
+ *                          omits file-backed private pages exactly this way,
+ *                          so every shared library's text segment in a real
+ *                          kernel core looks like this.
+ *   0 < p_filesz < p_memsz the tail was not saved (a sparse or partly
+ *                          unreadable mapping).
+ *
+ * Reporting absent memory as zeros is the bug this distinction exists to
+ * prevent: a backtrace through a NULL-filled stack invents frames, and a
+ * hexdump of pages that were never saved looks exactly like a page of real
+ * zeros. corex says "absent" and reads nothing.
+ */
+static const struct seg *seg_of(uint64_t addr)
+{
+	for (unsigned i = 0; i < nsegs; i++)
+		if (segs[i].type == PT_LOAD && segs[i].memsz &&
+		    addr >= segs[i].vaddr && addr - segs[i].vaddr < segs[i].memsz)
+			return &segs[i];
+	return NULL;
+}
+
+/* A pointer to len bytes of process memory at addr, or NULL if that range is
+ * not stored in this core. Never returns a short read and never substitutes
+ * zeros for missing pages. */
+static const uint8_t *mem(uint64_t addr, uint64_t len)
+{
+	const struct seg *s = seg_of(addr);
+	if (!s || len == 0)
+		return NULL;
+	uint64_t d = addr - s->vaddr;
+	if (d >= s->filesz || len > s->filesz - d)
+		return NULL;		/* mapped, but not saved in the core */
+	return at(s->off + d, len);
+}
+
+static void show_maps(void)
+{
+	char pb[4];
+	for (unsigned i = 0; i < nsegs; i++) {
+		if (segs[i].type != PT_LOAD)
+			continue;
+		const struct seg *s = &segs[i];
+		const char *present = s->filesz == 0 ? "absent" :
+				      s->filesz < s->memsz ? "partial" : "present";
+		const struct fmap *f = fmap_of(s->vaddr);
+		printf("map 0x%" PRIx64 " 0x%" PRIx64 " %s memsz 0x%" PRIx64
+		       " filesz 0x%" PRIx64 " %s",
+		       s->vaddr, s->vaddr + s->memsz, perms(s->flags, pb),
+		       s->memsz, s->filesz, present);
+		if (f)
+			printf(" %s+0x%" PRIx64, f->name,
+			       f->off + (s->vaddr - f->start));
+		else
+			printf(" anon");
+		printf("\n");
+	}
+}
+
+/* -x ADDR[,LEN] */
+static void hexdump(uint64_t addr, uint64_t len)
+{
+	const struct seg *s = seg_of(addr);
+	if (!s) {
+		printf("x 0x%" PRIx64 ": unmapped, no PT_LOAD covers it\n", addr);
+		exit(1);
+	}
+	for (uint64_t o = 0; o < len; o += 16) {
+		uint64_t k = len - o < 16 ? len - o : 16;
+		const uint8_t *p = mem(addr + o, k);
+		if (!p) {
+			char pb[4];
+			printf("x 0x%" PRIx64 ": absent -- mapped %s, memsz "
+			       "0x%" PRIx64 ", but only 0x%" PRIx64 " bytes of it "
+			       "are in this core\n", addr + o,
+			       perms(s->flags, pb), s->memsz, s->filesz);
+			exit(1);
+		}
+		printf("x 0x%" PRIx64, addr + o);
+		for (uint64_t j = 0; j < k; j++)
+			printf(" %02x", p[j]);
+		for (uint64_t j = k; j < 16; j++)
+			printf("   ");
+		printf(" |");
+		for (uint64_t j = 0; j < k; j++)
+			putchar(p[j] >= 32 && p[j] < 127 ? p[j] : '.');
+		printf("|\n");
+	}
+}
+
 /* ---- main --------------------------------------------------------------- */
 
 static void usage(void)
 {
-	fputs("usage: corex [--phdrs] [--notes] [--proc] [--signal] [--threads]\n             [--regs] [--auxv] [--files] CORE\n", stderr);
+	fputs("usage: corex [--phdrs] [--notes] [--proc] [--signal] [--threads]\n             [--regs] [--auxv] [--files] [--maps]\n             [-x ADDR[,LEN]] CORE\n", stderr);
 	exit(2);
 }
 
@@ -663,7 +768,9 @@ int main(int argc, char **argv)
 {
 	int want_phdrs = 0, want_notes = 0, want_proc = 0;
 	int want_sig = 0, want_threads = 0, want_regs = 0, want_auxv = 0;
-	int want_files = 0, any = 0;
+	int want_files = 0, want_maps = 0, any = 0;
+	uint64_t xaddr = 0, xlen = 64;
+	int want_x = 0;
 
 	for (int i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "--phdrs")) { want_phdrs = any = 1; }
@@ -674,13 +781,24 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[i], "--regs")) { want_regs = want_threads = any = 1; }
 		else if (!strcmp(argv[i], "--auxv")) { want_auxv = any = 1; }
 		else if (!strcmp(argv[i], "--files")) { want_files = any = 1; }
+		else if (!strcmp(argv[i], "--maps")) { want_maps = any = 1; }
+		else if (!strcmp(argv[i], "-x") && i + 1 < argc) {
+			char *end;
+			xaddr = strtoull(argv[++i], &end, 0);
+			if (*end == ',')
+				xlen = strtoull(end + 1, &end, 0);
+			if (*end)
+				usage();
+			want_x = any = 1;
+		}
 		else if (argv[i][0] == '-' && argv[i][1]) usage();
 		else if (cpath) usage();
 		else cpath = argv[i];
 	}
 	if (!cpath) usage();
 	if (!any) want_phdrs = want_notes = want_proc = want_sig =
-			want_threads = want_regs = want_auxv = want_files = 1;
+			want_threads = want_regs = want_auxv = want_files =
+			want_maps = 1;
 
 	int fd = open(cpath, O_RDONLY);
 	if (fd < 0) { perror(cpath); return 3; }
@@ -712,5 +830,9 @@ int main(int argc, char **argv)
 		show_auxv();
 	if (want_files)
 		show_files();
+	if (want_maps)
+		show_maps();
+	if (want_x)
+		hexdump(xaddr, xlen);
 	return 0;
 }
