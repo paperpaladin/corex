@@ -472,6 +472,75 @@ chk "gdb finds the same number of frames" "$(wc -l <$S/gdb.btdeep | tr -d ' ')" 
 cmp -s $S/gdb.btdeep $S/cx.btdeep && ok "all 1002 frame addresses agree with gdb" || {
 	no "deep backtrace disagrees with gdb"; diff $S/gdb.btdeep $S/cx.btdeep | head -4; }
 
+# -- truncation and mutation sweeps ----------------------------------------
+# A core file is untrusted binary: offsets and sizes inside it decide what
+# corex reads. Cut a valid core at 130 offsets and flip single bytes in its
+# headers and notes 400 times, and every run must exit 0 or 1 within the
+# timeout -- never a signal, never a hang, never an exit code that means
+# something went wrong in a way nobody thought about.
+if python3 - $COREX $S/core.seg $S/trunc.tmp <<'PY'
+import os, random, struct, subprocess, sys
+
+corex, core, tmp = sys.argv[1], sys.argv[2], sys.argv[3]
+b = open(core, 'rb').read()
+phoff, = struct.unpack_from('<Q', b, 0x20)
+psz, pn = struct.unpack_from('<HH', b, 0x36)
+note = [struct.unpack_from('<IIQQQQQQ', b, phoff + i * psz) for i in range(pn)]
+note = [s for s in note if s[0] == 4][0]
+nstart, nend = note[2], note[2] + note[5]
+
+def run(path):
+	try:
+		p = subprocess.run([corex, path], stdout=subprocess.DEVNULL,
+				   stderr=subprocess.PIPE, timeout=20)
+	except subprocess.TimeoutExpired:
+		return 'timeout', b''
+	return p.returncode, p.stderr
+
+bad, msgs = [], set()
+
+offs = set(range(0, 260, 4))
+offs |= {phoff + i * psz for i in range(pn)}
+offs |= {phoff + i * psz + 32 for i in range(pn)}
+offs |= set(range(nstart, nend, max(1, (nend - nstart) // 40)))
+offs |= {nend - 1, nend, nend + 1, len(b) // 2, len(b) - 1}
+offs = sorted(o for o in offs if 0 <= o < len(b))
+for o in offs:
+	open(tmp, 'wb').write(b[:o])
+	rc, err = run(tmp)
+	if rc not in (0, 1):
+		bad.append(('truncate', o, rc, err[:120]))
+	if err:
+		msgs.add(err.split(b':')[-1].strip()[:40])
+	# Anything that cuts into the notes must be diagnosed, not shrugged off.
+	if o < nend and rc != 1:
+		bad.append(('truncate-into-notes-not-reported', o, rc, err[:120]))
+
+random.seed(1234)
+for i in range(400):
+	buf = bytearray(b)
+	o = random.randrange(0, nend)
+	buf[o] ^= 1 << random.randrange(8)
+	open(tmp, 'wb').write(buf)
+	rc, err = run(tmp)
+	if rc not in (0, 1):
+		bad.append(('mutate', o, rc, err[:120]))
+	if err:
+		msgs.add(err.split(b':')[-1].strip()[:40])
+
+os.unlink(tmp)
+for x in bad[:6]:
+	print(x)
+print('%d truncations, 400 mutations, %d distinct diagnostics' %
+      (len(offs), len(msgs)))
+sys.exit(1 if bad else 0)
+PY
+then
+	ok "truncation and mutation sweeps: every run exited cleanly"
+else
+	no "a truncated or mutated core crashed, hung, or was not diagnosed"
+fi
+
 # -- rejecting what is not a core ------------------------------------------
 $COREX corex.c >/dev/null 2>$S/err; rc=$?
 chk "a C source file is rejected (exit 1)" "$rc" "1"
