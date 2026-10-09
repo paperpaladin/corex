@@ -1,0 +1,5 @@
+corex
+scratch/
+*.o
+core
+core.*
