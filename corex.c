@@ -712,6 +712,11 @@ static void show_files(void)
  * hexdump of pages that were never saved looks exactly like a page of real
  * zeros. corex says "absent" and reads nothing.
  */
+/* shortcut: linear scan of the segment table per lookup, which the unwinder
+ * does once per frame -- 18 segments times 1002 frames here. The ceiling is a
+ * core of a process with tens of thousands of mappings (PN_XNUM territory),
+ * where this wants sorting by vaddr once and a binary search. Overlapping
+ * PT_LOADs resolve to the first in file order; real cores have none. */
 static const struct seg *seg_of(uint64_t addr)
 {
 	for (unsigned i = 0; i < nsegs; i++)

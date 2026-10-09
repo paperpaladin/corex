@@ -78,35 +78,62 @@ Ranked by how little we control them:
 - [x] ELF header validation and the program header walk, against `readelf`
       - why: nothing else can be reached without the segment table, and
         `readelf -lW` settles it independently on commit one.
-- [ ] the PT_NOTE iterator and its 4-byte alignment rule
+- [x] the PT_NOTE iterator and its 4-byte alignment rule
       - why: the single most common core-parsing bug is padding the name
         field wrong, and every remaining fact lives behind this loop.
-- [ ] NT_PRPSINFO: command, state, pid/ppid/pgrp/sid, uid/gid
+- [x] NT_PRPSINFO: command, state, pid/ppid/pgrp/sid, uid/gid
       - why: the smallest fixed-layout note, so the struct offsets get a
         cheap first test before the 27-register one.
-- [ ] NT_PRSTATUS: registers and signal, compared with gdb register by register
-      - why: the register set is the core's reason for existing.
-- [ ] multiple threads: one NT_PRSTATUS per thread, count and order
+- [x] NT_PRSTATUS: registers and signal, compared with gdb register by register
+      - why: the register set is the core's reason for existing. All 27 agree.
+- [x] multiple threads: one NT_PRSTATUS per thread, count and order
       - why: getting the thread count or order wrong is easy and silent.
-- [ ] NT_AUXV, decoded
+        This is where the oracle caught the pr_cursig assumption.
+- [x] NT_AUXV, decoded
       - why: needed on its own, and it is the anchor that locates argv/envp.
-- [ ] NT_FILE: the mapped file list
+- [x] NT_FILE: the mapped file list
       - why: this is what turns an address into a file and an offset.
-- [ ] the PT_LOAD map, p_filesz == 0 handling, and -x to read memory
+- [x] the PT_LOAD map, p_filesz == 0 handling, and -x to read memory
       - why: memory that was mapped but not stored must read as absent, not
         as zeros.
-- [ ] the frame-pointer backtrace
+- [x] the frame-pointer backtrace
       - why: the deliverable that makes the rest useful.
-- [ ] the command line and environment from the initial stack
+- [x] the command line and environment from the initial stack
       - why: no note carries them; they have to be found in memory.
-- [ ] gdb comparison: every register of every thread
-- [ ] gdb comparison: backtrace frames and their order
-- [ ] gdb comparison: `info proc mappings` vs the PT_LOAD table
-- [ ] gdb comparison: signal, si_code and faulting address
-- [ ] the truncation sweep and the byte mutation sweep
-- [ ] `make test-asan`
-- [ ] a core with p_filesz == 0 segments, and a PN_XNUM core
-      - why: gcore never emits either, so both have to be synthesised; the
-        kernel's default coredump_filter produces filesz 0 constantly.
-- [ ] a 1000-frame stack: the unwinder terminates and agrees on the count
-- [ ] README and PLAN
+- [x] a SIGABRT core: a signal with no faulting address
+      - why: si_code SI_TKILL means the siginfo union holds a sender, not an
+        address, and printing si_addr anyway gives a plausible lie. This is
+        where the oracle caught the prefix-vs-subsequence assumption.
+- [x] a 1000-frame stack: the unwinder terminates and agrees on the count
+- [x] the truncation sweep and the byte mutation sweep
+- [x] synthesised fixtures: p_filesz == 0, PN_XNUM, note name padding 1..8
+- [x] `make test-asan`, `make valgrind`, exhaustive header bit flips
+- [x] --all, the report order, and the exit codes
+- [x] README and PLAN
+
+Next, in order:
+
+- [ ] run corex on a core this kernel wrote
+      - why: the one gap the suite cannot close here. Every core in the suite
+        comes from `gdb gcore`; `core_pattern` pipes to systemd-coredump,
+        writing it needs real root (`unshare -r` does not help, it is not
+        namespaced) and `coredumpctl` is absent. The p_filesz == 0 and
+        PN_XNUM shapes are therefore synthesised, not observed. On a machine
+        with root: `echo core > /proc/sys/kernel/core_pattern`, `ulimit -c
+        unlimited`, and compare against the fixtures.
+- [ ] decode NT_FPREGSET and NT_X86_XSTATE
+      - why: `--notes` already lists them with their sizes, and gdb's `info
+        all-registers` is sitting right there as the oracle for xmm/ymm. The
+        x87 tag word and the XSAVE component offsets are the interesting part.
+- [ ] a 32-bit (ELFCLASS32) core
+      - why: currently rejected at the header, which is honest but narrow.
+        `gcc -m32` plus a second `pr_reg` layout; the note format is identical,
+        so this is mostly a second register map.
+- [ ] sort the segment table once and binary-search it
+      - why: the `shortcut:` comment in `seg_of()`. Only matters at PN_XNUM
+        scale, which is also the only shape that cannot be tested here yet.
+- [ ] report the thread whose `si_code` and `pr_info` disagree with
+      `NT_SIGINFO`
+      - why: a core where the two notes tell different stories is either a
+        producer bug or a tampered file, and corex currently silently prefers
+        NT_SIGINFO without saying the other said otherwise.
