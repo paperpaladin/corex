@@ -54,7 +54,7 @@ fi
 # bytes. An iterator that pads either one wrong still decodes the first note
 # and then desyncs, so the test is the whole list, in order, to the last note.
 readelf -n $S/core.seg | awk '/^  [A-Z]/ && $2 ~ /^0x/ {print $1, $2, $3}' | nz > $S/re.notes
-$COREX --notes $S/core.seg | awk '{print $2, $3, $4}' | nz > $S/cx.notes
+$COREX --notes $S/core.seg | awk '$1=="note"{print $2, $3, $4}' | nz > $S/cx.notes
 if cmp -s $S/re.notes $S/cx.notes; then
 	ok "note list agrees with readelf -n, owner/size/type, in order ($(wc -l <$S/re.notes | tr -d ' ') notes)"
 else
@@ -226,7 +226,7 @@ if a != b:
 print(len(a))
 PY
 then
-	ok "all $(python3 -c 'print(sum(1 for l in open("'$S'/cx.auxv")))') auxv entries agree with gdb, key and value"
+	ok "all $(grep -c '^auxv ' $S/cx.auxv) auxv entries agree with gdb, key and value"
 else
 	no "auxv disagrees with gdb"
 fi
@@ -237,7 +237,7 @@ fi
 # page_size multiplication on file_ofs.
 gdbb $S/seg $S/core.seg -ex 'info proc mappings' 2>&1 |
 	awk '$1 ~ /^0x/ {print $1, $2, $4, $5}' | nz | sort > $S/gdb.files
-$COREX --files $S/core.seg | awk '{print $2, $3, $5, $6}' | nz | sort > $S/cx.files
+$COREX --files $S/core.seg | awk '$1=="file"{print $2, $3, $5, $6}' | nz | sort > $S/cx.files
 if cmp -s $S/gdb.files $S/cx.files; then
 	ok "all $(wc -l <$S/cx.files | tr -d ' ') NT_FILE mappings agree with gdb: start, end, file offset, name"
 else
@@ -255,7 +255,7 @@ gdbb $S/seg $S/core.seg -ex 'maint info sections' 2>&1 | grep -E 'load[0-9]+' |
 	                               if ($i=="CODE") x="x" }
 	       print $2, c, ro x }' | nz | sort > $S/gdb.maps
 $COREX --maps $S/core.seg |
-	awk '{ st=$9; if (st=="partial") st="present"; print $2, $3, st, $4 }' |
+	awk '$1=="map" { st=$9; if (st=="partial") st="present"; print $2, $3, st, $4 }' |
 	nz | sort > $S/cx.maps
 if cmp -s $S/gdb.maps $S/cx.maps; then
 	ok "all $(wc -l <$S/cx.maps | tr -d ' ') PT_LOAD mappings agree with gdb: range, permissions, contents present"
@@ -492,7 +492,7 @@ nstart, nend = note[2], note[2] + note[5]
 
 def run(path):
 	try:
-		p = subprocess.run([corex, path], stdout=subprocess.DEVNULL,
+		p = subprocess.run([corex, '--all', path], stdout=subprocess.DEVNULL,
 				   stderr=subprocess.PIPE, timeout=20)
 	except subprocess.TimeoutExpired:
 		return 'timeout', b''
@@ -651,7 +651,7 @@ gdbb $S/seg $S/core.filesz0 -ex 'maint info sections' 2>&1 | grep -E 'load[0-9]+
 	                               if ($i=="CODE") x="x" }
 	       print $2, c, ro x }' | nz | sort > $S/gdb.maps0
 $COREX --maps $S/core.filesz0 |
-	awk '{ st=$9; if (st=="partial") st="present"; print $2, $3, st, $4 }' | nz | sort > $S/cx.maps0
+	awk '$1=="map" { st=$9; if (st=="partial") st="present"; print $2, $3, st, $4 }' | nz | sort > $S/cx.maps0
 cmp -s $S/gdb.maps0 $S/cx.maps0 && ok "core.filesz0: gdb agrees which mappings have no contents" || {
 	no "core.filesz0: disagrees with gdb on which mappings are absent"
 	diff $S/gdb.maps0 $S/cx.maps0 | head -4; }
@@ -669,16 +669,28 @@ got=$($COREX --phdrs $S/core.xnum | sed -n 's/^core:.* \([0-9]*\) program header
 chk "core.xnum: PN_XNUM phdr count read from shdr[0].sh_info, agrees with readelf ($want)" "$got" "$want"
 
 readelf -n $S/core.pad | awk '/^  [A-Za-z]/ && $2 ~ /^0x/ {print $1, $2}' | nz > $S/re.pad
-$COREX --notes $S/core.pad | awk '{print $2, $3}' | nz > $S/cx.pad
+$COREX --notes $S/core.pad | awk '$1=="note"{print $2, $3}' | nz > $S/cx.pad
 if cmp -s $S/re.pad $S/cx.pad; then
 	ok "core.pad: all $(wc -l <$S/cx.pad | tr -d ' ') notes agree with readelf across name lengths 1..8"
 else
 	no "core.pad: note list disagrees with readelf"; diff $S/re.pad $S/cx.pad | head -6
 fi
-$COREX --regs $S/core.pad > $S/cx.padregs
-$COREX --regs $S/core.seg > $S/cx.segregs
+$COREX --regs $S/core.pad | grep '^reg ' > $S/cx.padregs
+$COREX --regs $S/core.seg | grep '^reg ' > $S/cx.segregs
 cmp -s $S/cx.padregs $S/cx.segregs && ok "core.pad: the registers are still the original core's, so the iterator did not desync" || {
 	no "core.pad: register dump changed"; diff $S/cx.padregs $S/cx.segregs | head -4; }
+
+# -- usage and exit codes --------------------------------------------------
+# 0 fine, 1 the core is malformed, 2 the command line is wrong, 3 the file
+# could not be opened. A core reader that exits 0 on a file it could not read
+# is the one failure that cannot be noticed from a script.
+$COREX >/dev/null 2>&1; chk "no arguments is a usage error (exit 2)" "$?" "2"
+$COREX --nonesuch $S/core.seg >/dev/null 2>&1; chk "an unknown option is a usage error (exit 2)" "$?" "2"
+$COREX $S/core.seg $S/core.seg >/dev/null 2>&1; chk "two cores is a usage error (exit 2)" "$?" "2"
+$COREX /nonexistent-core >/dev/null 2>&1; chk "an unopenable file exits 3" "$?" "3"
+$COREX / >/dev/null 2>&1; chk "a directory is rejected (exit 1)" "$?" "1"
+: > $S/empty; $COREX $S/empty >/dev/null 2>&1; chk "an empty file is rejected (exit 1)" "$?" "1"
+$COREX --all $S/core.seg >/dev/null 2>&1; chk "--all succeeds on a good core (exit 0)" "$?" "0"
 
 # -- rejecting what is not a core ------------------------------------------
 $COREX corex.c >/dev/null 2>$S/err; rc=$?

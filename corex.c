@@ -140,7 +140,8 @@ static const char *perms(uint32_t f, char *b)
 	return b;
 }
 
-static void show_segs(void)
+/* Always printed: what file this is, and the shape of it. */
+static void show_ident(void)
 {
 	unsigned nload = 0, nnote = 0;
 	for (unsigned i = 0; i < nsegs; i++) {
@@ -149,6 +150,10 @@ static void show_segs(void)
 	}
 	printf("core: %s %zu bytes, %u program headers (%u PT_LOAD, %u PT_NOTE)\n",
 	       cpath, N, nsegs, nload, nnote);
+}
+
+static void show_segs(void)
+{
 	char p[4];
 	for (unsigned i = 0; i < nsegs; i++)
 		printf("phdr %u %s off 0x%" PRIx64 " vaddr 0x%" PRIx64
@@ -991,7 +996,7 @@ static void show_cmdline(void)
 
 static void usage(void)
 {
-	fputs("usage: corex [--phdrs] [--notes] [--proc] [--signal] [--threads]\n             [--regs] [--auxv] [--files] [--maps] [--bt] [--cmdline]\n             [-x ADDR[,LEN]] CORE\n", stderr);
+	fputs("usage: corex [--phdrs] [--notes] [--proc] [--signal] [--threads]\n             [--regs] [--auxv] [--files] [--maps] [--bt] [--cmdline]\n             [-x ADDR[,LEN]] [--all] CORE\n", stderr);
 	exit(2);
 }
 
@@ -1024,14 +1029,21 @@ int main(int argc, char **argv)
 				usage();
 			want_x = any = 1;
 		}
+		else if (!strcmp(argv[i], "--all")) {
+			want_phdrs = want_notes = want_proc = want_sig =
+			want_threads = want_regs = want_auxv = want_files =
+			want_maps = want_bt = want_cmd = any = 1;
+		}
 		else if (argv[i][0] == '-' && argv[i][1]) usage();
 		else if (cpath) usage();
 		else cpath = argv[i];
 	}
 	if (!cpath) usage();
-	if (!any) want_phdrs = want_notes = want_proc = want_sig =
-			want_threads = want_regs = want_auxv = want_files =
-			want_maps = want_bt = want_cmd = 1;
+	/* The default report leaves out the two container-level dumps, which
+	 * are what --phdrs, --notes and --all are for. */
+	if (!any) want_proc = want_sig = want_threads = want_regs =
+			want_auxv = want_files = want_maps = want_bt =
+			want_cmd = 1;
 
 	int fd = open(cpath, O_RDONLY);
 	if (fd < 0) { perror(cpath); return 3; }
@@ -1049,22 +1061,24 @@ int main(int argc, char **argv)
 	load_notes();
 	load_threads();
 	load_files();
+
+	show_ident();
 	if (want_phdrs)
 		show_segs();
 	if (want_notes)
 		show_notes();
-	if (want_proc)
-		show_prpsinfo();
 	if (want_sig)
 		show_signal();
+	if (want_proc)
+		show_prpsinfo();
 	if (want_threads)
 		show_threads(want_regs);
-	if (want_auxv)
-		show_auxv();
-	if (want_files)
-		show_files();
 	if (want_maps)
 		show_maps();
+	if (want_files)
+		show_files();
+	if (want_auxv)
+		show_auxv();
 	if (want_cmd)
 		show_cmdline();
 	if (want_bt)
