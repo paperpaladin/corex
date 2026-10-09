@@ -8,6 +8,7 @@ COREX=${COREX:-./corex}
 PWD=$(pwd)
 S=scratch
 mkdir -p $S || exit 1
+printf 'corex under test: %s\n\n' "$COREX"
 
 pass=0; fail=0; skip=0
 ok()   { printf 'ok    %s\n' "$1"; pass=$((pass+1)); }
@@ -516,6 +517,20 @@ for o in offs:
 	if o < nend and rc != 1:
 		bad.append(('truncate-into-notes-not-reported', o, rc, err[:120]))
 
+# Every byte of the ELF header and the program header table, one bit each:
+# these are the fields that decide how far every later read is allowed to go,
+# so they get an exhaustive pass rather than a sampled one.
+for o in range(0, phoff + pn * psz):
+	buf = bytearray(b)
+	buf[o] ^= 0x80
+	open(tmp, 'wb').write(buf)
+	rc, err = run(tmp)
+	if rc not in (0, 1):
+		bad.append(('header-bit', o, rc, err[:120]))
+	if err:
+		msgs.add(err.split(b':')[-1].strip()[:40])
+nhdr = phoff + pn * psz
+
 random.seed(1234)
 for i in range(400):
 	buf = bytearray(b)
@@ -531,8 +546,8 @@ for i in range(400):
 os.unlink(tmp)
 for x in bad[:6]:
 	print(x)
-print('%d truncations, 400 mutations, %d distinct diagnostics' %
-      (len(offs), len(msgs)))
+print('%d truncations, %d header bit flips, 400 note mutations, '
+      '%d distinct diagnostics' % (len(offs), nhdr, len(msgs)))
 sys.exit(1 if bad else 0)
 PY
 then

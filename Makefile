@@ -16,8 +16,17 @@ test-asan:
 	    -o corex-asan corex.c
 	COREX=./corex-asan t/run.sh
 
+# Also clean under valgrind, on a real core and on the synthesised fixtures.
+valgrind: corex
+	t/run.sh >/dev/null
+	for c in scratch/core.seg scratch/core.pad scratch/core.filesz0 \
+	         scratch/core.threads scratch/core.xnum; do \
+	    valgrind -q --error-exitcode=9 ./corex $$c >/dev/null || exit 1; \
+	done
+	@echo "valgrind: clean"
+
 clean:
 	rm -f corex corex-asan
 	rm -rf scratch
 
-.PHONY: all test test-asan clean
+.PHONY: all test test-asan valgrind clean
