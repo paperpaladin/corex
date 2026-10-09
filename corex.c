@@ -580,18 +580,90 @@ static void show_auxv(void)
 	}
 }
 
+/* ---- NT_FILE: the mapped file list ---------------------------------------
+ *
+ *   u64 count
+ *   u64 page_size
+ *   count x { u64 start, u64 end, u64 file_ofs }
+ *   count x NUL-terminated file name, in the same order
+ *
+ * file_ofs is in units of page_size, which is the detail that bites: the
+ * kernel writes page_size 4096 and offsets in pages, while gdb's gcore writes
+ * page_size 1 and offsets in bytes. Both are legal. Multiply, never assume.
+ *
+ * This is the note that turns an address into a file and an offset, and it is
+ * the only place in the core where the names of the mapped files appear.
+ */
+struct fmap {
+	uint64_t start, end, off;	/* off is in bytes, already multiplied */
+	const char *name;
+};
+
+static struct fmap *fmaps;
+static unsigned nfmaps;
+
+static void load_files(void)
+{
+	const struct note *n = find_note(NT_FILE, 0);
+	if (!n)
+		return;
+	if (n->descsz < 16)
+		die("NT_FILE note is %" PRIu64 " bytes, too short for its header",
+		    n->descsz);
+	uint64_t count = u64(n->desc), psz = u64(n->desc + 8);
+	if (count > (n->descsz - 16) / 24)
+		die("NT_FILE claims %" PRIu64 " mappings but the note holds "
+		    "%" PRIu64 " bytes", count, n->descsz);
+	if (psz == 0)
+		die("NT_FILE page size is 0");
+	fmaps = calloc(count ? count : 1, sizeof *fmaps);
+	if (!fmaps)
+		die("out of memory");
+
+	/* The names follow the table, one NUL-terminated string per entry, in
+	 * order. A name whose NUL is missing means the note is truncated. */
+	uint64_t p = 16 + count * 24;
+	for (uint64_t i = 0; i < count; i++) {
+		const uint8_t *e = n->desc + 16 + i * 24;
+		fmaps[i].start = u64(e);
+		fmaps[i].end = u64(e + 8);
+		fmaps[i].off = u64(e + 16) * psz;
+		uint64_t q = p;
+		while (q < n->descsz && n->desc[q])
+			q++;
+		if (q >= n->descsz)
+			die("NT_FILE name %" PRIu64 " is not terminated inside "
+			    "the note", i);
+		fmaps[i].name = (const char *)n->desc + p;
+		p = q + 1;
+	}
+	nfmaps = count;
+}
+
+static void show_files(void)
+{
+	if (!nfmaps) {
+		printf("files: no NT_FILE note\n");
+		return;
+	}
+	for (unsigned i = 0; i < nfmaps; i++)
+		printf("file 0x%" PRIx64 " 0x%" PRIx64 " off 0x%" PRIx64 " %s\n",
+		       fmaps[i].start, fmaps[i].end, fmaps[i].off, fmaps[i].name);
+}
+
 /* ---- main --------------------------------------------------------------- */
 
 static void usage(void)
 {
-	fputs("usage: corex [--phdrs] [--notes] [--proc] [--signal] [--threads]\n             [--regs] [--auxv] CORE\n", stderr);
+	fputs("usage: corex [--phdrs] [--notes] [--proc] [--signal] [--threads]\n             [--regs] [--auxv] [--files] CORE\n", stderr);
 	exit(2);
 }
 
 int main(int argc, char **argv)
 {
 	int want_phdrs = 0, want_notes = 0, want_proc = 0;
-	int want_sig = 0, want_threads = 0, want_regs = 0, want_auxv = 0, any = 0;
+	int want_sig = 0, want_threads = 0, want_regs = 0, want_auxv = 0;
+	int want_files = 0, any = 0;
 
 	for (int i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "--phdrs")) { want_phdrs = any = 1; }
@@ -601,13 +673,14 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[i], "--threads")) { want_threads = any = 1; }
 		else if (!strcmp(argv[i], "--regs")) { want_regs = want_threads = any = 1; }
 		else if (!strcmp(argv[i], "--auxv")) { want_auxv = any = 1; }
+		else if (!strcmp(argv[i], "--files")) { want_files = any = 1; }
 		else if (argv[i][0] == '-' && argv[i][1]) usage();
 		else if (cpath) usage();
 		else cpath = argv[i];
 	}
 	if (!cpath) usage();
 	if (!any) want_phdrs = want_notes = want_proc = want_sig =
-			want_threads = want_regs = want_auxv = 1;
+			want_threads = want_regs = want_auxv = want_files = 1;
 
 	int fd = open(cpath, O_RDONLY);
 	if (fd < 0) { perror(cpath); return 3; }
@@ -624,6 +697,7 @@ int main(int argc, char **argv)
 	load_phdrs();
 	load_notes();
 	load_threads();
+	load_files();
 	if (want_phdrs)
 		show_segs();
 	if (want_notes)
@@ -636,5 +710,7 @@ int main(int argc, char **argv)
 		show_threads(want_regs);
 	if (want_auxv)
 		show_auxv();
+	if (want_files)
+		show_files();
 	return 0;
 }

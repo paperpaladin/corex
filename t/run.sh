@@ -229,6 +229,19 @@ else
 	no "auxv disagrees with gdb"
 fi
 
+# -- NT_FILE, against gdb's info proc mappings -----------------------------
+# On a core, gdb's "info proc mappings" *is* the NT_FILE note, so this
+# compares two independent decodings of the same bytes, including the
+# page_size multiplication on file_ofs.
+gdbb $S/seg $S/core.seg -ex 'info proc mappings' 2>&1 |
+	awk '$1 ~ /^0x/ {print $1, $2, $4, $5}' | nz | sort > $S/gdb.files
+$COREX --files $S/core.seg | awk '{print $2, $3, $5, $6}' | nz | sort > $S/cx.files
+if cmp -s $S/gdb.files $S/cx.files; then
+	ok "all $(wc -l <$S/cx.files | tr -d ' ') NT_FILE mappings agree with gdb: start, end, file offset, name"
+else
+	no "NT_FILE disagrees with gdb"; diff $S/gdb.files $S/cx.files | head -6
+fi
+
 # -- rejecting what is not a core ------------------------------------------
 $COREX corex.c >/dev/null 2>$S/err; rc=$?
 chk "a C source file is rejected (exit 1)" "$rc" "1"
