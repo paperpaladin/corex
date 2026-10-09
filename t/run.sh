@@ -223,7 +223,6 @@ if a != b:
 	print('gdb:', a[:40])
 	print('us :', b[:40])
 	sys.exit(1)
-print(len(a))
 PY
 then
 	ok "all $(grep -c '^auxv ' $S/cx.auxv) auxv entries agree with gdb, key and value"
