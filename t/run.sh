@@ -456,6 +456,22 @@ else
 	no "SIGABRT backtrace is not a subsequence of gdb's"
 fi
 
+# -- a 1000-frame stack ----------------------------------------------------
+# The depth is in the source, so the frame count is known before anything
+# runs: 1001 calls to rec() plus main. This is the check that the walk ends
+# because the chain ended, and the check that nothing in it is quadratic.
+gen deep || exit 1
+ok "gcore: wrote a core for t/deep.c (1000 frames deep)"
+bt_cx $S/core.deep 1 > $S/cx.btdeep
+chk "the backtrace is the 1002 frames the source builds" "$(wc -l <$S/cx.btdeep | tr -d ' ')" "1002"
+$COREX --bt $S/core.deep | tail -1 | grep -q '1002 frames (' &&
+	ok "and corex says why the walk ended, not just that it did" ||
+	no "no termination reason printed"
+bt_gdb $S/core.deep $S/deep > $S/gdb.btdeep
+chk "gdb finds the same number of frames" "$(wc -l <$S/gdb.btdeep | tr -d ' ')" "1002"
+cmp -s $S/gdb.btdeep $S/cx.btdeep && ok "all 1002 frame addresses agree with gdb" || {
+	no "deep backtrace disagrees with gdb"; diff $S/gdb.btdeep $S/cx.btdeep | head -4; }
+
 # -- rejecting what is not a core ------------------------------------------
 $COREX corex.c >/dev/null 2>$S/err; rc=$?
 chk "a C source file is rejected (exit 1)" "$rc" "1"
