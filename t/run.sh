@@ -295,6 +295,77 @@ $COREX -x 0x1,16 $S/core.seg >$S/out 2>&1; rc=$?
 chk "reading an unmapped address fails (exit 1)" "$rc" "1"
 grep -q unmapped $S/out && ok "and says the address is unmapped" || no "no diagnostic for unmapped read"
 
+# -- the backtrace, against gdb's bt ---------------------------------------
+# Two comparisons. The frame addresses, which are ours, must equal gdb's frame
+# for frame; and the function names, which are gdb's (corex deliberately has no
+# symbol table reader -- see README), must come out in the same order. Naming
+# our addresses with "info symbol" and naming gdb's frames with "bt" are
+# separate code paths in gdb, so agreeing is not circular.
+bt_gdb() {   # bt_gdb CORE BIN [cmd]
+	# gdb prints frame #0 once in its "Program terminated" preamble and again
+	# in the backtrace, so everything before the marker is dropped.
+	gdbb "$2" "$1" -ex 'set print frame-info location-and-address' \
+		-ex 'echo @@@\n' -ex "${3:-bt}" 2>&1 | sed -n '/^@@@/,$p' |
+		sed -n 's/^#[0-9]* *\(0x[0-9a-f]*\) .*/\1/p' | nz
+}
+bt_cx() {    # bt_cx CORE THREAD
+	$COREX --bt "$1" | awk -v t="$2" '/^bt thread/ { on = ($3 == t) }
+	                                  /^#/ { if (on) print $2 }' | nz
+}
+bt_names_gdb() {
+	gdbb "$2" "$1" -ex 'echo @@@\n' -ex "${3:-bt}" 2>&1 | sed -n '/^@@@/,$p' |
+		sed -n 's/^#[0-9]* .* in \([A-Za-z_][A-Za-z_0-9]*\) (.*/\1/p'
+}
+bt_names_of_addrs() {   # bt_names_of_addrs CORE BIN < addrs
+	c=$1; b=$2
+	set -- ; while read -r a; do set -- "$@" -ex "info symbol $a"; done
+	gdbb "$b" "$c" "$@" 2>&1 | sed -n 's/^\([A-Za-z_][A-Za-z_0-9]*\) \(+ [0-9]* \)*in section .*/\1/p'
+}
+
+bt_gdb $S/core.seg $S/seg > $S/gdb.bt
+bt_cx $S/core.seg 1 > $S/cx.bt
+n=$(wc -l <$S/cx.bt | tr -d ' ')
+if [ "$n" -eq 5 ] && cmp -s $S/gdb.bt $S/cx.bt; then
+	ok "all $n backtrace frame addresses agree with gdb, in order (t/seg.c is 4 deep plus main)"
+else
+	no "backtrace disagrees with gdb"; diff $S/gdb.bt $S/cx.bt
+fi
+bt_names_of_addrs $S/core.seg $S/seg <$S/cx.bt > $S/cx.names
+bt_names_gdb $S/core.seg $S/seg > $S/gdb.names
+chk "the frames name d c b a main, in that order" "$(tr '\n' ' ' <$S/cx.names)" "d c b a main "
+cmp -s $S/gdb.names $S/cx.names && ok "and gdb's bt names the same functions in the same order" || {
+	no "frame function names disagree with gdb"; diff $S/gdb.names $S/cx.names; }
+
+# Per thread, on the four-thread core. Here corex is allowed to stop early
+# but never to differ: its frame list must be a *prefix* of gdb's. gdb unwinds
+# libc with CFI out of .eh_frame and so walks on through start_thread into
+# __GI___clone3, which has no frame pointer to follow; corex stops when the
+# chain runs out. Dropping a frame honestly is a documented limitation.
+# Inventing or reordering one would be a bug, and this is the check that would
+# catch it.
+bad=0; ours=0; theirs=0
+i=1
+while [ $i -le 4 ]; do
+	bt_gdb $S/core.threads $S/threads "thread apply $i bt" > $S/gdb.bt$i
+	bt_cx $S/core.threads $i > $S/cx.bt$i
+	k=$(wc -l <$S/cx.bt$i | tr -d ' ')
+	head -n "$k" $S/gdb.bt$i > $S/pre.bt$i
+	cmp -s $S/pre.bt$i $S/cx.bt$i || { bad=$((bad+1)); diff $S/pre.bt$i $S/cx.bt$i | head -4; }
+	ours=$((ours + k)); theirs=$((theirs + $(wc -l <$S/gdb.bt$i | tr -d ' ')))
+	i=$((i+1))
+done
+if [ $bad -eq 0 ] && [ $ours -gt 0 ]; then
+	ok "every frame of all 4 threads agrees with gdb ($ours frames; gdb reaches $theirs, the rest are frame-pointerless libc frames)"
+else
+	no "$bad of 4 thread backtraces differ from gdb's ($ours vs $theirs frames)"
+fi
+
+# Each of the three spinning threads must be in its own function.
+$COREX --bt $S/core.threads | awk '/^bt thread/ { on = ($3 ~ /^[0-9]+$/) }
+                                   /^#0/ { if (on) print $2 }' > $S/cx.tops
+got=$(bt_names_of_addrs $S/core.threads $S/threads <$S/cx.tops | sort | tr '\n' ' ')
+chk "the four threads are in four different functions" "$got" "main th_alpha th_beta th_gamma "
+
 # -- rejecting what is not a core ------------------------------------------
 $COREX corex.c >/dev/null 2>$S/err; rc=$?
 chk "a C source file is rejected (exit 1)" "$rc" "1"

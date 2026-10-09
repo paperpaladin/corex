@@ -382,6 +382,15 @@ static const struct { const char *name; int i; } REGMAP[NGREG] = {
 	{ "fs_base", 21 }, { "gs_base", 22 }, { "orig_rax", 15 },
 };
 
+static uint64_t reg_by_name(const struct thread *t, const char *n)
+{
+	for (int i = 0; i < NGREG; i++)
+		if (!strcmp(REGMAP[i].name, n))
+			return t->reg[REGMAP[i].i];
+	die("no register named %s", n);
+	return 0;
+}
+
 static void load_threads(void)
 {
 	for (unsigned i = 0; i < nnotes; i++) {
@@ -702,6 +711,15 @@ static const uint8_t *mem(uint64_t addr, uint64_t len)
 	return at(s->off + d, len);
 }
 
+static int mem_u64(uint64_t addr, uint64_t *out)
+{
+	const uint8_t *p = mem(addr, 8);
+	if (!p)
+		return 0;
+	*out = u64(p);
+	return 1;
+}
+
 static void show_maps(void)
 {
 	char pb[4];
@@ -756,11 +774,79 @@ static void hexdump(uint64_t addr, uint64_t len)
 	}
 }
 
+/* ---- the backtrace ------------------------------------------------------
+ *
+ * Frame pointers only. At -O0 with -fno-omit-frame-pointer every function
+ * starts with push %rbp / mov %rsp,%rbp, so [rbp] is the caller's rbp and
+ * [rbp+8] is the return address, and the chain is a linked list up the stack.
+ * This is the same mechanism prof (sibling repo) uses on live samples, and it
+ * carries the same precondition: an optimised binary that reuses rbp as a
+ * general register has no chain to walk and the backtrace stops at depth 1.
+ * Nothing here reads DWARF, so there is no CFI-based unwinding and no inlined
+ * frames. Both are stated in the README.
+ *
+ * The unwinder must terminate on garbage, because a corrupt or hostile core
+ * can point rbp anywhere. Four rules do it, and all four are necessary:
+ *   - the frame pointer must stay inside the one PT_LOAD that holds this
+ *     thread's rsp, so the chain cannot wander off into another mapping
+ *   - it must be 8-byte aligned
+ *   - it must strictly increase, so a self-referential or cyclic chain ends
+ *   - a zero return address or a frame whose two words are not stored in the
+ *     core ends the walk
+ * plus a hard cap, so even a chain that satisfies all four cannot run forever
+ * on a core with a very large stack segment.
+ */
+#define MAXFRAMES 8192
+
+static void backtrace_thread(const struct thread *t, unsigned idx)
+{
+	uint64_t pc = reg_by_name(t, "rip");
+	uint64_t bp = reg_by_name(t, "rbp");
+	uint64_t sp = reg_by_name(t, "rsp");
+	const struct seg *stack = seg_of(sp);
+	const char *why = "reached the outermost frame";
+	unsigned n = 0;
+
+	printf("bt thread %u tid %" PRId32 "\n", idx + 1, t->pid);
+	for (;;) {
+		const struct fmap *f = fmap_of(pc);
+		printf("#%u 0x%" PRIx64, n, pc);
+		if (f)
+			printf(" %s+0x%" PRIx64, f->name, pc - f->start + f->off);
+		else
+			printf(" (no mapped file)");
+		printf("\n");
+		if (++n >= MAXFRAMES) { why = "hit the frame cap"; break; }
+
+		if (!stack || seg_of(bp) != stack) {
+			why = "frame pointer left the stack mapping";
+			break;
+		}
+		if (bp & 7) { why = "frame pointer is misaligned"; break; }
+		uint64_t nbp, ret;
+		if (!mem_u64(bp, &nbp) || !mem_u64(bp + 8, &ret)) {
+			why = "frame is not stored in this core";
+			break;
+		}
+		if (ret == 0) { why = "return address is 0"; break; }
+		if (nbp <= bp) { why = "frame pointer did not increase"; break; }
+		pc = ret;
+		bp = nbp;
+	}
+	printf("bt thread %u: %u frames (%s)\n", idx + 1, n, why);
+}
+
+static void show_bt(void)
+{
+	for (unsigned i = 0; i < nthreads; i++)
+		backtrace_thread(&threads[i], i);
+}
+
 /* ---- main --------------------------------------------------------------- */
 
 static void usage(void)
 {
-	fputs("usage: corex [--phdrs] [--notes] [--proc] [--signal] [--threads]\n             [--regs] [--auxv] [--files] [--maps]\n             [-x ADDR[,LEN]] CORE\n", stderr);
+	fputs("usage: corex [--phdrs] [--notes] [--proc] [--signal] [--threads]\n             [--regs] [--auxv] [--files] [--maps] [--bt]\n             [-x ADDR[,LEN]] CORE\n", stderr);
 	exit(2);
 }
 
@@ -768,7 +854,7 @@ int main(int argc, char **argv)
 {
 	int want_phdrs = 0, want_notes = 0, want_proc = 0;
 	int want_sig = 0, want_threads = 0, want_regs = 0, want_auxv = 0;
-	int want_files = 0, want_maps = 0, any = 0;
+	int want_files = 0, want_maps = 0, want_bt = 0, any = 0;
 	uint64_t xaddr = 0, xlen = 64;
 	int want_x = 0;
 
@@ -782,6 +868,7 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[i], "--auxv")) { want_auxv = any = 1; }
 		else if (!strcmp(argv[i], "--files")) { want_files = any = 1; }
 		else if (!strcmp(argv[i], "--maps")) { want_maps = any = 1; }
+		else if (!strcmp(argv[i], "--bt")) { want_bt = any = 1; }
 		else if (!strcmp(argv[i], "-x") && i + 1 < argc) {
 			char *end;
 			xaddr = strtoull(argv[++i], &end, 0);
@@ -798,7 +885,7 @@ int main(int argc, char **argv)
 	if (!cpath) usage();
 	if (!any) want_phdrs = want_notes = want_proc = want_sig =
 			want_threads = want_regs = want_auxv = want_files =
-			want_maps = 1;
+			want_maps = want_bt = 1;
 
 	int fd = open(cpath, O_RDONLY);
 	if (fd < 0) { perror(cpath); return 3; }
@@ -832,6 +919,8 @@ int main(int argc, char **argv)
 		show_files();
 	if (want_maps)
 		show_maps();
+	if (want_bt)
+		show_bt();
 	if (want_x)
 		hexdump(xaddr, xlen);
 	return 0;
