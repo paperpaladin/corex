@@ -189,6 +189,46 @@ else
 	no "$bad of 4 threads disagree with gdb on registers ($agree values matched)"
 fi
 
+# -- NT_AUXV, against gdb's info auxv --------------------------------------
+# gdb prints some auxv values in hex and some in decimal, and AT_PLATFORM with
+# the string it points at, so both sides are reduced to (key, integer value)
+# before comparing.
+gdbb $S/seg $S/core.seg -ex 'info auxv' >$S/gdb.auxv 2>&1
+$COREX --auxv $S/core.seg >$S/cx.auxv
+if python3 - $S/gdb.auxv $S/cx.auxv <<'PY'
+import re, sys
+
+num = re.compile(r'^(0x[0-9a-fA-F]+|[0-9]+)$')
+
+def gdb(path):
+	out = []
+	for line in open(path):
+		f = line.split()
+		if len(f) < 3 or not f[0].isdigit() or not f[1].startswith('AT_'):
+			continue
+		for tok in reversed(f[2:]):          # last numeric token is the value
+			if num.match(tok):
+				out.append((int(f[0]), int(tok, 0)))
+				break
+	return out
+
+def cx(path):
+	return [(int(f[1]), int(f[3], 16))
+		for f in (l.split() for l in open(path)) if f and f[0] == 'auxv']
+
+a, b = gdb(sys.argv[1]), cx(sys.argv[2])
+if a != b:
+	print('gdb:', a[:40])
+	print('us :', b[:40])
+	sys.exit(1)
+print(len(a))
+PY
+then
+	ok "all $(python3 -c 'print(sum(1 for l in open("'$S'/cx.auxv")))') auxv entries agree with gdb, key and value"
+else
+	no "auxv disagrees with gdb"
+fi
+
 # -- rejecting what is not a core ------------------------------------------
 $COREX corex.c >/dev/null 2>$S/err; rc=$?
 chk "a C source file is rejected (exit 1)" "$rc" "1"

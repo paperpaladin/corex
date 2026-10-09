@@ -520,18 +520,78 @@ static void show_threads(int regs)
 	}
 }
 
+/* ---- NT_AUXV: the auxiliary vector --------------------------------------
+ *
+ * An array of (uint64 key, uint64 value) ending at key AT_NULL. This is the
+ * same block the kernel pushed onto the process stack at exec, which is what
+ * makes it useful twice: for what it says, and as a landmark for finding the
+ * initial stack frame (see show_cmdline).
+ */
+static const char *auxv_name(uint64_t k)
+{
+	switch (k) {
+	case 0:  return "AT_NULL";
+	case 1:  return "AT_IGNORE";
+	case 2:  return "AT_EXECFD";
+	case 3:  return "AT_PHDR";
+	case 4:  return "AT_PHENT";
+	case 5:  return "AT_PHNUM";
+	case 6:  return "AT_PAGESZ";
+	case 7:  return "AT_BASE";
+	case 8:  return "AT_FLAGS";
+	case 9:  return "AT_ENTRY";
+	case 10: return "AT_NOTELF";
+	case 11: return "AT_UID";
+	case 12: return "AT_EUID";
+	case 13: return "AT_GID";
+	case 14: return "AT_EGID";
+	case 15: return "AT_PLATFORM";
+	case 16: return "AT_HWCAP";
+	case 17: return "AT_CLKTCK";
+	case 23: return "AT_SECURE";
+	case 24: return "AT_BASE_PLATFORM";
+	case 25: return "AT_RANDOM";
+	case 26: return "AT_HWCAP2";
+	case 27: return "AT_RSEQ_FEATURE_SIZE";
+	case 28: return "AT_RSEQ_ALIGN";
+	case 29: return "AT_HWCAP3";
+	case 30: return "AT_HWCAP4";
+	case 31: return "AT_EXECFN";
+	case 32: return "AT_SYSINFO";
+	case 33: return "AT_SYSINFO_EHDR";
+	case 51: return "AT_MINSIGSTKSZ";
+	default: return "AT_?";
+	}
+}
+
+static void show_auxv(void)
+{
+	const struct note *n = find_note(NT_AUXV, 0);
+	if (!n) {
+		printf("auxv: no NT_AUXV note\n");
+		return;
+	}
+	uint64_t o = 0;
+	for (; o + 16 <= n->descsz; o += 16) {
+		uint64_t k = u64(n->desc + o), v = u64(n->desc + o + 8);
+		printf("auxv %" PRIu64 " %s 0x%" PRIx64 "\n", k, auxv_name(k), v);
+		if (k == 0)
+			break;
+	}
+}
+
 /* ---- main --------------------------------------------------------------- */
 
 static void usage(void)
 {
-	fputs("usage: corex [--phdrs] [--notes] [--proc] [--signal] [--threads]\n             [--regs] CORE\n", stderr);
+	fputs("usage: corex [--phdrs] [--notes] [--proc] [--signal] [--threads]\n             [--regs] [--auxv] CORE\n", stderr);
 	exit(2);
 }
 
 int main(int argc, char **argv)
 {
 	int want_phdrs = 0, want_notes = 0, want_proc = 0;
-	int want_sig = 0, want_threads = 0, want_regs = 0, any = 0;
+	int want_sig = 0, want_threads = 0, want_regs = 0, want_auxv = 0, any = 0;
 
 	for (int i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "--phdrs")) { want_phdrs = any = 1; }
@@ -540,13 +600,14 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[i], "--signal")) { want_sig = any = 1; }
 		else if (!strcmp(argv[i], "--threads")) { want_threads = any = 1; }
 		else if (!strcmp(argv[i], "--regs")) { want_regs = want_threads = any = 1; }
+		else if (!strcmp(argv[i], "--auxv")) { want_auxv = any = 1; }
 		else if (argv[i][0] == '-' && argv[i][1]) usage();
 		else if (cpath) usage();
 		else cpath = argv[i];
 	}
 	if (!cpath) usage();
 	if (!any) want_phdrs = want_notes = want_proc = want_sig =
-			want_threads = want_regs = 1;
+			want_threads = want_regs = want_auxv = 1;
 
 	int fd = open(cpath, O_RDONLY);
 	if (fd < 0) { perror(cpath); return 3; }
@@ -573,5 +634,7 @@ int main(int argc, char **argv)
 		show_signal();
 	if (want_threads)
 		show_threads(want_regs);
+	if (want_auxv)
+		show_auxv();
 	return 0;
 }
