@@ -573,6 +573,25 @@ static const char *auxv_name(uint64_t k)
 	}
 }
 
+/* AT_EXECFN and AT_PLATFORM point at strings on the process stack. */
+static uint64_t auxv_get(uint64_t key, int *found)
+{
+	const struct note *n = find_note(NT_AUXV, 0);
+	*found = 0;
+	if (!n)
+		return 0;
+	for (uint64_t o = 0; o + 16 <= n->descsz; o += 16) {
+		uint64_t k = u64(n->desc + o);
+		if (k == 0)
+			break;
+		if (k == key) {
+			*found = 1;
+			return u64(n->desc + o + 8);
+		}
+	}
+	return 0;
+}
+
 static void show_auxv(void)
 {
 	const struct note *n = find_note(NT_AUXV, 0);
@@ -720,6 +739,21 @@ static int mem_u64(uint64_t addr, uint64_t *out)
 	return 1;
 }
 
+/* A C string out of process memory, into a caller buffer, with a cap. */
+static int mem_str(uint64_t addr, char *buf, size_t cap)
+{
+	for (size_t i = 0; i + 1 < cap; i++) {
+		const uint8_t *p = mem(addr + i, 1);
+		if (!p)
+			return 0;
+		buf[i] = (char)*p;
+		if (!*p)
+			return 1;
+	}
+	buf[cap - 1] = 0;
+	return 1;
+}
+
 static void show_maps(void)
 {
 	char pb[4];
@@ -842,11 +876,122 @@ static void show_bt(void)
 		backtrace_thread(&threads[i], i);
 }
 
+/* ---- the command line and the environment --------------------------------
+ *
+ * No note carries them. NT_PRPSINFO's pr_psargs is the command line only up
+ * to 80 characters and with the NULs turned into spaces, so it cannot be
+ * split back into arguments and anything longer is simply gone. The real
+ * argv and envp are still on the process stack, in the frame the kernel built
+ * at exec:
+ *
+ *   [high]  the strings: execfn, the environment, the arguments
+ *           the auxv payloads (AT_RANDOM's 16 bytes, AT_PLATFORM's string)
+ *           auxv: (key, value) pairs, terminated by AT_NULL   <-- landmark
+ *           envp[]: pointers, terminated by NULL
+ *           argv[]: pointers, terminated by NULL
+ *           argc
+ *   [low]   <- the initial rsp
+ *
+ * rsp has moved on by the time the process dies, so the frame is found by its
+ * contents rather than by an address: the NT_AUXV note is a byte-for-byte copy
+ * of the auxv block still lying on that stack, so searching the stack segment
+ * for those bytes locates it, and everything else is counted backwards from
+ * there. envp ends immediately below auxv; argv ends immediately below envp;
+ * argc is the slot below argv, identified by holding exactly the number of
+ * argv pointers just counted.
+ *
+ * shortcut: the landmark search is a plain memmem over the stack segment,
+ * O(stack size) once. The ceiling is a core whose stack is gigabytes, where
+ * it would be worth starting the search from AT_EXECFN's page and walking
+ * down instead.
+ */
+#define MAXVEC 8192
+#define MAXSTR 8192
+
+static uint64_t find_auxv_on_stack(void)
+{
+	const struct note *n = find_note(NT_AUXV, 0);
+	int found;
+	uint64_t execfn = auxv_get(31 /* AT_EXECFN */, &found);
+	if (!n || !found)
+		return 0;
+	const struct seg *s = seg_of(execfn);	/* the initial stack */
+	if (!s || s->filesz < 16)
+		return 0;
+
+	/* Match up to and including the AT_NULL pair. */
+	uint64_t len = 0;
+	while (len + 16 <= n->descsz) {
+		uint64_t k = u64(n->desc + len);
+		len += 16;
+		if (k == 0)
+			break;
+	}
+	if (len > s->filesz)
+		return 0;
+	const uint8_t *hay = at(s->off, s->filesz);
+	if (!hay)
+		return 0;
+	const uint8_t *hit = memmem(hay, s->filesz, n->desc, len);
+	if (!hit)
+		return 0;
+	/* A second occurrence would make the landmark ambiguous. */
+	if (memmem(hit + 1, s->filesz - (size_t)(hit + 1 - hay), n->desc, len))
+		return 0;
+	return s->vaddr + (uint64_t)(hit - hay);
+}
+
+static void show_cmdline(void)
+{
+	uint64_t auxv = find_auxv_on_stack();
+	if (!auxv) {
+		printf("cmdline: not recoverable (the auxv block was not found "
+		       "on the stack)\n");
+		return;
+	}
+	printf("stack-frame: auxv at 0x%" PRIx64 "\n", auxv);
+
+	uint64_t p = auxv - 8, v;
+	if (!mem_u64(p, &v) || v != 0) {
+		printf("cmdline: not recoverable (no envp terminator below auxv)\n");
+		return;
+	}
+	uint64_t env[MAXVEC], arg[MAXVEC];
+	unsigned nenv = 0, narg = 0;
+	for (p -= 8; mem_u64(p, &v) && v; p -= 8) {
+		if (nenv == MAXVEC)
+			break;
+		env[nenv++] = v;
+	}
+	if (v != 0) {
+		printf("cmdline: not recoverable (no argv terminator below envp)\n");
+		return;
+	}
+	for (p -= 8; mem_u64(p, &v); p -= 8) {
+		if (v == narg)		/* this slot is argc */
+			break;
+		if (v == 0 || narg == MAXVEC) {
+			printf("cmdline: not recoverable (argv does not end in "
+			       "an argc that counts it)\n");
+			return;
+		}
+		arg[narg++] = v;
+	}
+	char buf[MAXSTR];
+	printf("cmdline: argc %u envc %u\n", narg, nenv);
+	for (unsigned i = 0; i < narg; i++)	/* collected downwards */
+		printf("arg %u %s\n", i,
+		       mem_str(arg[narg - 1 - i], buf, sizeof buf) ? buf : "?");
+	for (unsigned i = 0; i < nenv; i++)
+		printf("env %u %s\n", i,
+		       mem_str(env[nenv - 1 - i], buf, sizeof buf) ? buf : "?");
+}
+
 /* ---- main --------------------------------------------------------------- */
 
 static void usage(void)
 {
-	fputs("usage: corex [--phdrs] [--notes] [--proc] [--signal] [--threads]\n             [--regs] [--auxv] [--files] [--maps] [--bt]\n             [-x ADDR[,LEN]] CORE\n", stderr);
+	fputs("usage: corex [--phdrs] [--notes] [--proc] [--signal] [--threads]\n             [--regs] [--auxv] [--files] [--maps] [--bt] [--cmdline]\n             [-x ADDR[,LEN]] CORE\n", stderr);
 	exit(2);
 }
 
@@ -854,7 +999,7 @@ int main(int argc, char **argv)
 {
 	int want_phdrs = 0, want_notes = 0, want_proc = 0;
 	int want_sig = 0, want_threads = 0, want_regs = 0, want_auxv = 0;
-	int want_files = 0, want_maps = 0, want_bt = 0, any = 0;
+	int want_files = 0, want_maps = 0, want_bt = 0, want_cmd = 0, any = 0;
 	uint64_t xaddr = 0, xlen = 64;
 	int want_x = 0;
 
@@ -869,6 +1014,7 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[i], "--files")) { want_files = any = 1; }
 		else if (!strcmp(argv[i], "--maps")) { want_maps = any = 1; }
 		else if (!strcmp(argv[i], "--bt")) { want_bt = any = 1; }
+		else if (!strcmp(argv[i], "--cmdline")) { want_cmd = any = 1; }
 		else if (!strcmp(argv[i], "-x") && i + 1 < argc) {
 			char *end;
 			xaddr = strtoull(argv[++i], &end, 0);
@@ -885,7 +1031,7 @@ int main(int argc, char **argv)
 	if (!cpath) usage();
 	if (!any) want_phdrs = want_notes = want_proc = want_sig =
 			want_threads = want_regs = want_auxv = want_files =
-			want_maps = want_bt = 1;
+			want_maps = want_bt = want_cmd = 1;
 
 	int fd = open(cpath, O_RDONLY);
 	if (fd < 0) { perror(cpath); return 3; }
@@ -919,6 +1065,8 @@ int main(int argc, char **argv)
 		show_files();
 	if (want_maps)
 		show_maps();
+	if (want_cmd)
+		show_cmdline();
 	if (want_bt)
 		show_bt();
 	if (want_x)

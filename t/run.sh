@@ -5,6 +5,7 @@
 set -u
 cd "$(dirname "$0")/.." || exit 1
 COREX=${COREX:-./corex}
+PWD=$(pwd)
 S=scratch
 mkdir -p $S || exit 1
 
@@ -365,6 +366,41 @@ $COREX --bt $S/core.threads | awk '/^bt thread/ { on = ($3 ~ /^[0-9]+$/) }
                                    /^#0/ { if (on) print $2 }' > $S/cx.tops
 got=$(bt_names_of_addrs $S/core.threads $S/threads <$S/cx.tops | sort | tr '\n' ' ')
 chk "the four threads are in four different functions" "$got" "main th_alpha th_beta th_gamma "
+
+# -- the command line and the environment ----------------------------------
+# No note carries either one, so they are dug out of the initial stack frame.
+# The oracle is that the test *chooses* them: the core is made with a known
+# argv and, via env -i, an environment of exactly four variables. Anything
+# corex reports that was not put there is wrong, and anything missing is too.
+rm -f $S/core.args
+env -i COREX_MARK=hello PATH=/usr/bin HOME=/nonexistent LC_ALL=C \
+	gdb --batch -nx -iex 'set debuginfod enabled off' \
+	    -ex 'run alpha beta gamma' -ex "gcore $S/core.args" $S/seg \
+	    >$S/gen.args.log 2>&1
+if [ ! -s $S/core.args ]; then
+	no "could not make a core with a controlled argv and environment"
+else
+	ok "gcore: wrote a core with a known argv and a 4-variable environment"
+	$COREX --cmdline $S/core.args > $S/cx.cmd
+	got=$(sed -n 's/^arg [0-9]* //p' $S/cx.cmd | tr '\n' ' ')
+	chk "argv recovered from the stack" "$got" "$PWD/$S/seg alpha beta gamma "
+	chk "argc agrees" "$(sed -n 's/^cmdline: argc \([0-9]*\) .*/\1/p' $S/cx.cmd)" "4"
+	sed -n 's/^env [0-9]* //p' $S/cx.cmd | sort > $S/cx.env
+	# gdb adds COLUMNS, LINES and PWD to the inferior's environment itself, so
+	# the expected set is the 4 exported plus those 3, and nothing else.
+	printf 'COLUMNS=80\nCOREX_MARK=hello\nHOME=/nonexistent\nLC_ALL=C\nLINES=24\nPATH=/usr/bin\nPWD=%s\n' "$PWD" > $S/want.env
+	cmp -s $S/want.env $S/cx.env && ok "the environment is exactly the 7 variables that were set" || {
+		no "environment disagrees with what was exported"; diff $S/want.env $S/cx.env; }
+	# psargs is the same command line truncated to 80 bytes with NULs turned
+	# into spaces, so it must be a prefix of what we reassembled.
+	psa=$($COREX --proc $S/core.args | sed -n 's/^psargs: //p')
+	full=$(sed -n 's/^arg [0-9]* //p' $S/cx.cmd | tr '\n' ' ')
+	case "$full " in "$psa "*) ok "NT_PRPSINFO's pr_psargs is a prefix of the recovered argv" ;;
+		*) no "pr_psargs [$psa] is not a prefix of [$full]" ;; esac
+fi
+# The real argv of the other cores must match what gen() ran.
+got=$($COREX --cmdline $S/core.threads | sed -n 's/^arg [0-9]* //p' | tr '\n' ' ')
+chk "argv of the threads core" "$got" "$PWD/$S/threads "
 
 # -- rejecting what is not a core ------------------------------------------
 $COREX corex.c >/dev/null 2>$S/err; rc=$?
