@@ -134,6 +134,61 @@ want=$(tr ',' '\n' <$S/gdb.sig | sed -n 's/.*_sigfault = {si_addr = \(0x[0-9a-f]
 got=$($COREX --signal $S/core.seg | sed -n 's/^fault: address //p')
 chk "faulting address agrees with gdb \$_siginfo->si_addr ($want)" "$got" "$want"
 
+# -- multiple threads ------------------------------------------------------
+# One NT_PRSTATUS per thread. Getting the count or the order wrong is easy and
+# nothing else in the output looks different when you do.
+gen threads -pthread || exit 1
+ok "gcore: wrote a core for t/threads.c"
+gdbb $S/threads $S/core.threads -ex 'info threads' >$S/gdb.threads 2>&1
+
+tidre='s/^[* ] *[0-9]* *Thread [^(]*(LWP \([0-9]*\)).*/\1/p'
+want=$(sed -n "$tidre" $S/gdb.threads | wc -l | tr -d ' ')
+got=$($COREX --threads $S/core.threads | sed -n 's/^threads: //p')
+chk "thread count agrees with gdb ($want, built as 4)" "$got" "$want"
+chk "thread count is the 4 the program creates" "$got" "4"
+
+sed -n "$tidre" $S/gdb.threads | sort > $S/gdb.tids
+$COREX --threads $S/core.threads | sed -n 's/^thread [0-9]* tid \([0-9]*\) .*/\1/p' | sort > $S/cx.tids
+cmp -s $S/gdb.tids $S/cx.tids && ok "the set of tids agrees with gdb" || {
+	no "tid set disagrees with gdb"; diff $S/gdb.tids $S/cx.tids; }
+sed -n 's/^tid //p' $S/gen.threads.log | sort > $S/self.tids
+cmp -s $S/self.tids $S/cx.tids && ok "...and with the tids the program printed itself" || {
+	no "tid set disagrees with what the process reported via gettid()"
+	diff $S/self.tids $S/cx.tids; }
+
+# The signalled thread is written first, by both the kernel and gcore, and gdb
+# marks it with '*'.
+want=$(sed -n '/^\*/'"$tidre" $S/gdb.threads)
+got=$($COREX --threads $S/core.threads | sed -n 's/^thread 1 tid \([0-9]*\) .*/\1/p')
+chk "thread 1 is the thread that took the signal ($want)" "$got" "$want"
+# Both the kernel and gcore stamp pr_cursig on *every* thread's NT_PRSTATUS,
+# not only the one that faulted, so the signalled thread is identified by
+# being written first and not by being the only one with a signal.
+got=$($COREX --threads $S/core.threads | grep -c 'cursig 11')
+chk "every thread's NT_PRSTATUS records the killing signal" "$got" "4"
+
+# Every register of every thread, not just the crashing one. gdb numbers
+# threads in core order, so gdb's thread N must be our thread N.
+agree=0; bad=0
+i=1
+while [ $i -le 4 ]; do
+	regs_of_gdb $S/core.threads $S/threads "thread apply $i info registers" >$S/gdb.r$i
+	$COREX --regs $S/core.threads |
+		awk -v t=$i '$1=="thread"{n=$2} $1=="reg" && n==t {print $2, $3}' |
+		nz | sort > $S/cx.r$i
+	if cmp -s $S/gdb.r$i $S/cx.r$i; then
+		agree=$((agree + $(wc -l <$S/gdb.r$i | tr -d ' ')))
+	else
+		bad=$((bad + 1)); diff $S/gdb.r$i $S/cx.r$i | head -4
+	fi
+	i=$((i + 1))
+done
+if [ $bad -eq 0 ] && [ $agree -eq 108 ]; then
+	ok "all $agree registers of all 4 threads agree with gdb, thread by thread"
+else
+	no "$bad of 4 threads disagree with gdb on registers ($agree values matched)"
+fi
+
 # -- rejecting what is not a core ------------------------------------------
 $COREX corex.c >/dev/null 2>$S/err; rc=$?
 chk "a C source file is rejected (exit 1)" "$rc" "1"
