@@ -160,26 +160,135 @@ static void show_segs(void)
 		       perms(segs[i].flags, p));
 }
 
+/* ---- the PT_NOTE iterator ----------------------------------------------
+ *
+ * A note is three 32-bit words (namesz, descsz, type), then the name padded
+ * to a 4-byte boundary, then the descriptor padded to a 4-byte boundary. The
+ * padding is the trap: it is 4 bytes in a 64-bit core even though the PT_NOTE
+ * segment's p_align may say 8, and the pad after the *name* is the field
+ * everyone forgets. Get it wrong and the first note still parses, which is
+ * why the bug survives -- the notes after it decode as garbage or vanish.
+ * The test for this is the whole note list compared against readelf -n: a
+ * desynced iterator cannot reach the last note.
+ */
+
+#define NT_PRSTATUS	1
+#define NT_PRFPREG	2
+#define NT_PRPSINFO	3
+#define NT_TASKSTRUCT	4
+#define NT_AUXV		6
+#define NT_SIGINFO	0x53494749
+#define NT_FILE		0x46494c45
+#define NT_PRXFPREG	0x46e62b7f
+#define NT_X86_XSTATE	0x202
+#define NT_GDB_TDESC	0xff000000
+
+struct note {
+	uint32_t type;
+	const char *name;	/* not necessarily NUL-terminated: use namesz */
+	uint32_t namesz;
+	const uint8_t *desc;
+	uint64_t descsz;
+};
+
+static struct note *notes;
+static unsigned nnotes;
+
+static uint64_t align4(uint64_t v)
+{
+	return (v + 3) & ~(uint64_t)3;
+}
+
+static void load_notes(void)
+{
+	for (unsigned i = 0; i < nsegs; i++) {
+		if (segs[i].type != PT_NOTE)
+			continue;
+		if (!in_file(segs[i].off, segs[i].filesz))
+			die("PT_NOTE segment %u (0x%" PRIx64 " bytes at 0x%" PRIx64
+			    ") runs past end of file (%zu bytes)",
+			    i, segs[i].filesz, segs[i].off, N);
+		uint64_t p = segs[i].off, end = p + segs[i].filesz;
+		while (p + 12 <= end) {
+			uint32_t namesz = u32(B + p);
+			uint32_t descsz = u32(B + p + 4);
+			uint32_t type = u32(B + p + 8);
+			uint64_t npad = align4(namesz), dpad = align4(descsz);
+			/* 12 + npad + dpad cannot overflow: both are u32 widened */
+			if (p + 12 + npad + dpad > end)
+				die("note %u at 0x%" PRIx64 " (namesz %u descsz %u) "
+				    "runs past the end of its PT_NOTE segment",
+				    nnotes, p, namesz, descsz);
+			notes = realloc(notes, (nnotes + 1) * sizeof *notes);
+			if (!notes)
+				die("out of memory");
+			notes[nnotes].type = type;
+			notes[nnotes].name = (const char *)B + p + 12;
+			notes[nnotes].namesz = namesz;
+			notes[nnotes].desc = B + p + 12 + npad;
+			notes[nnotes].descsz = descsz;
+			nnotes++;
+			p += 12 + npad + dpad;
+		}
+		if (p != end)
+			die("PT_NOTE segment %u has %" PRIu64 " trailing bytes",
+			    i, end - p);
+	}
+	if (!nnotes)
+		die("no notes: a core without PT_NOTE has no process state in it");
+}
+
+static const char *ntype(uint32_t t)
+{
+	switch (t) {
+	case NT_PRSTATUS:	return "NT_PRSTATUS";
+	case NT_PRFPREG:	return "NT_FPREGSET";
+	case NT_PRPSINFO:	return "NT_PRPSINFO";
+	case NT_TASKSTRUCT:	return "NT_TASKSTRUCT";
+	case NT_AUXV:		return "NT_AUXV";
+	case NT_SIGINFO:	return "NT_SIGINFO";
+	case NT_FILE:		return "NT_FILE";
+	case NT_PRXFPREG:	return "NT_PRXFPREG";
+	case NT_X86_XSTATE:	return "NT_X86_XSTATE";
+	case NT_GDB_TDESC:	return "NT_GDB_TDESC";
+	default:		return NULL;
+	}
+}
+
+static void show_notes(void)
+{
+	for (unsigned i = 0; i < nnotes; i++) {
+		const char *t = ntype(notes[i].type);
+		printf("note %.*s 0x%" PRIx64 " ", (int)notes[i].namesz,
+		       notes[i].name, notes[i].descsz);
+		if (t)
+			printf("%s\n", t);
+		else
+			printf("0x%" PRIx32 "\n", notes[i].type);
+	}
+}
+
 /* ---- main --------------------------------------------------------------- */
 
 static void usage(void)
 {
-	fputs("usage: corex [--phdrs] CORE\n", stderr);
+	fputs("usage: corex [--phdrs] [--notes] CORE\n", stderr);
 	exit(2);
 }
 
 int main(int argc, char **argv)
 {
-	int want_phdrs = 0, any = 0;
+	int want_phdrs = 0, want_notes = 0, any = 0;
 
 	for (int i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "--phdrs")) { want_phdrs = any = 1; }
+		else if (!strcmp(argv[i], "--notes")) { want_notes = any = 1; }
 		else if (argv[i][0] == '-' && argv[i][1]) usage();
 		else if (cpath) usage();
 		else cpath = argv[i];
 	}
 	if (!cpath) usage();
-	if (!any) want_phdrs = 1;
+	if (!any) want_phdrs = want_notes = 1;
 
 	int fd = open(cpath, O_RDONLY);
 	if (fd < 0) { perror(cpath); return 3; }
@@ -194,7 +303,10 @@ int main(int argc, char **argv)
 	B = m;
 
 	load_phdrs();
+	load_notes();
 	if (want_phdrs)
 		show_segs();
+	if (want_notes)
+		show_notes();
 	return 0;
 }

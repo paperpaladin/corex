@@ -47,6 +47,18 @@ else
 	no "PT_LOAD table disagrees with readelf"; diff $S/re.load $S/cx.load | head -5
 fi
 
+# -- the note list, against readelf -n ------------------------------------
+# A note's name field is padded to 4 bytes and its descriptor is padded to 4
+# bytes. An iterator that pads either one wrong still decodes the first note
+# and then desyncs, so the test is the whole list, in order, to the last note.
+readelf -n $S/core.seg | awk '/^  [A-Z]/ && $2 ~ /^0x/ {print $1, $2, $3}' | nz > $S/re.notes
+$COREX --notes $S/core.seg | awk '{print $2, $3, $4}' | nz > $S/cx.notes
+if cmp -s $S/re.notes $S/cx.notes; then
+	ok "note list agrees with readelf -n, owner/size/type, in order ($(wc -l <$S/re.notes | tr -d ' ') notes)"
+else
+	no "note list disagrees with readelf -n"; diff $S/re.notes $S/cx.notes | head -8
+fi
+
 # -- rejecting what is not a core ------------------------------------------
 $COREX corex.c >/dev/null 2>$S/err; rc=$?
 chk "a C source file is rejected (exit 1)" "$rc" "1"
