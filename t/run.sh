@@ -323,6 +323,27 @@ bt_names_of_addrs() {   # bt_names_of_addrs CORE BIN < addrs
 	gdbb "$b" "$c" "$@" 2>&1 | sed -n 's/^\([A-Za-z_][A-Za-z_0-9]*\) \(+ [0-9]* \)*in section .*/\1/p'
 }
 
+# corex's frames must be a subsequence of gdb's, in order: it may skip a
+# frame whose function does not maintain rbp, but it must never invent one,
+# reorder two, or report an address gdb does not have.
+bt_subseq() {   # bt_subseq GDB_ADDRS CX_ADDRS
+	python3 - "$1" "$2" <<'PY'
+import sys
+
+g = [l.strip() for l in open(sys.argv[1]) if l.strip()]
+c = [l.strip() for l in open(sys.argv[2]) if l.strip()]
+i = 0
+for a in c:
+	while i < len(g) and g[i] != a:
+		i += 1
+	if i == len(g):
+		print("frame %s is not in gdb's backtrace, or is out of order" % a)
+		sys.exit(1)
+	i += 1
+sys.exit(0)
+PY
+}
+
 bt_gdb $S/core.seg $S/seg > $S/gdb.bt
 bt_cx $S/core.seg 1 > $S/cx.bt
 n=$(wc -l <$S/cx.bt | tr -d ' ')
@@ -350,13 +371,12 @@ while [ $i -le 4 ]; do
 	bt_gdb $S/core.threads $S/threads "thread apply $i bt" > $S/gdb.bt$i
 	bt_cx $S/core.threads $i > $S/cx.bt$i
 	k=$(wc -l <$S/cx.bt$i | tr -d ' ')
-	head -n "$k" $S/gdb.bt$i > $S/pre.bt$i
-	cmp -s $S/pre.bt$i $S/cx.bt$i || { bad=$((bad+1)); diff $S/pre.bt$i $S/cx.bt$i | head -4; }
+	bt_subseq $S/gdb.bt$i $S/cx.bt$i || bad=$((bad+1))
 	ours=$((ours + k)); theirs=$((theirs + $(wc -l <$S/gdb.bt$i | tr -d ' ')))
 	i=$((i+1))
 done
 if [ $bad -eq 0 ] && [ $ours -gt 0 ]; then
-	ok "every frame of all 4 threads agrees with gdb ($ours frames; gdb reaches $theirs, the rest are frame-pointerless libc frames)"
+	ok "all $ours frames of all 4 threads are frames gdb also reports, in order (gdb reaches $theirs; the rest are frame-pointerless libc frames)"
 else
 	no "$bad of 4 thread backtraces differ from gdb's ($ours vs $theirs frames)"
 fi
@@ -401,6 +421,40 @@ fi
 # The real argv of the other cores must match what gen() ran.
 got=$($COREX --cmdline $S/core.threads | sed -n 's/^arg [0-9]* //p' | tr '\n' ' ')
 chk "argv of the threads core" "$got" "$PWD/$S/threads "
+
+# -- a different signal: SIGABRT, which has no faulting address ------------
+# abort() raises the signal against the process itself, so si_code is SI_TKILL
+# and the siginfo union holds a sender pid and uid, not an address. A reader
+# that prints si_addr unconditionally reports a nonsense faulting address here
+# -- gdb shows the same bytes as _sigfault.si_addr = 0x3e8003c9c3c, which is
+# just the pid and uid read as a pointer.
+gen abrt || exit 1
+ok "gcore: wrote a core for t/abrt.c"
+gdbb $S/abrt $S/core.abrt -ex 'p $_siginfo' >$S/gdb.abrt 2>&1
+want=$(sed -n 's/^Program terminated with signal \([A-Z0-9]*\),.*/\1/p' $S/gdb.abrt)
+got=$($COREX --signal $S/core.abrt | sed -n 's/^signal: \([A-Z0-9]*\) .*/\1/p')
+chk "killing signal agrees with gdb ($want)" "$got" "$want"
+want=$(tr ',' '\n' <$S/gdb.abrt | sed -n 's/.*si_code = \(-*[0-9]*\).*/\1/p' | head -1)
+got=$($COREX --signal $S/core.abrt | sed -n 's/^signal: .* code \(-*[0-9]*\) .*/\1/p')
+chk "si_code agrees with gdb ($want, SI_TKILL)" "$got" "$want"
+want=$(tr ',' '\n' <$S/gdb.abrt | sed -n 's/.*_kill = {si_pid = \([0-9]*\).*/\1/p' | head -1)
+got=$($COREX --signal $S/core.abrt | sed -n 's/^fault: sent by pid \([0-9]*\) .*/\1/p')
+chk "the sending pid agrees with gdb ($want)" "$got" "$want"
+got=$($COREX --signal $S/core.abrt | sed -n 's/^fault: sent by pid [0-9]* uid \([0-9]*\)/\1/p')
+chk "the sending uid is this user" "$got" "$(id -u)"
+$COREX --signal $S/core.abrt | grep -q 'fault: address' && no "a faulting address was printed for SIGABRT" ||
+	ok "no faulting address is claimed for SIGABRT"
+bt_gdb $S/core.abrt $S/abrt > $S/gdb.btabrt
+bt_cx $S/core.abrt 1 > $S/cx.btabrt
+k=$(wc -l <$S/cx.btabrt | tr -d ' ')
+# Here the skipped frames are in the middle, not at the end: the signal landed
+# inside libc, which keeps no frame pointer, so rbp still points at boom()'s
+# frame and the chain steps straight over raise() and abort().
+if bt_subseq $S/gdb.btabrt $S/cx.btabrt; then
+	ok "the $k frames of the SIGABRT backtrace are frames gdb also reports, in order (gdb reaches $(wc -l <$S/gdb.btabrt | tr -d ' '))"
+else
+	no "SIGABRT backtrace is not a subsequence of gdb's"
+fi
 
 # -- rejecting what is not a core ------------------------------------------
 $COREX corex.c >/dev/null 2>$S/err; rc=$?
