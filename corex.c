@@ -199,6 +199,13 @@ static uint64_t align4(uint64_t v)
 	return (v + 3) & ~(uint64_t)3;
 }
 
+static int nameis(const struct note *n, const char *s)
+{
+	size_t l = strlen(s);
+	/* namesz counts the NUL when there is one, and some producers omit it */
+	return (n->namesz == l || n->namesz == l + 1) && !memcmp(n->name, s, l);
+}
+
 static void load_notes(void)
 {
 	for (unsigned i = 0; i < nsegs; i++) {
@@ -268,27 +275,92 @@ static void show_notes(void)
 	}
 }
 
+/* ---- NT_PRPSINFO: the process, as ps would describe it ------------------
+ *
+ * struct elf_prpsinfo, 136 bytes, the same layout the kernel writes and gdb
+ * writes. Read by explicit offset rather than by casting to a struct, because
+ * the point of this program is to not depend on a header agreeing with the
+ * producer of the file.
+ */
+#define PRPSINFO_SZ	136
+
+static const struct note *find_note(uint32_t type, unsigned skip)
+{
+	for (unsigned i = 0; i < nnotes; i++)
+		if (notes[i].type == type && nameis(&notes[i], "CORE"))
+			if (skip-- == 0)
+				return &notes[i];
+	return NULL;
+}
+
+/* A fixed-size char array in a note is not required to be NUL-terminated:
+ * print at most n bytes and stop at the first NUL. */
+static void put_fixed(const char *tag, const uint8_t *p, size_t n)
+{
+	size_t l = 0;
+	while (l < n && p[l])
+		l++;
+	printf("%s %.*s\n", tag, (int)l, (const char *)p);
+}
+
+static const char *state_name(char c)
+{
+	switch (c) {
+	case 'R': return "running";
+	case 'S': return "sleeping";
+	case 'D': return "disk sleep";
+	case 'T': return "stopped";
+	case 't': return "tracing stop";
+	case 'Z': return "zombie";
+	case 'X': return "dead";
+	case 'I': return "idle";
+	default:  return "unknown";
+	}
+}
+
+static void show_prpsinfo(void)
+{
+	const struct note *n = find_note(NT_PRPSINFO, 0);
+	if (!n) {
+		printf("proc: no NT_PRPSINFO note\n");
+		return;
+	}
+	if (n->descsz < PRPSINFO_SZ)
+		die("NT_PRPSINFO is %" PRIu64 " bytes, want at least %u",
+		    n->descsz, PRPSINFO_SZ);
+	const uint8_t *d = n->desc;
+	printf("proc: pid %" PRId32 " ppid %" PRId32 " pgrp %" PRId32
+	       " sid %" PRId32 " uid %" PRIu32 " gid %" PRIu32 "\n",
+	       (int32_t)u32(d + 24), (int32_t)u32(d + 28), (int32_t)u32(d + 32),
+	       (int32_t)u32(d + 36), u32(d + 16), u32(d + 20));
+	printf("state: %c (%s) nice %d\n", d[1] ? d[1] : '?',
+	       state_name((char)d[1]), (int)(int8_t)d[3]);
+	put_fixed("cmd:", d + 40, 16);
+	put_fixed("psargs:", d + 56, 80);
+}
+
 /* ---- main --------------------------------------------------------------- */
 
 static void usage(void)
 {
-	fputs("usage: corex [--phdrs] [--notes] CORE\n", stderr);
+	fputs("usage: corex [--phdrs] [--notes] [--proc] CORE\n", stderr);
 	exit(2);
 }
 
 int main(int argc, char **argv)
 {
-	int want_phdrs = 0, want_notes = 0, any = 0;
+	int want_phdrs = 0, want_notes = 0, want_proc = 0, any = 0;
 
 	for (int i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "--phdrs")) { want_phdrs = any = 1; }
 		else if (!strcmp(argv[i], "--notes")) { want_notes = any = 1; }
+		else if (!strcmp(argv[i], "--proc")) { want_proc = any = 1; }
 		else if (argv[i][0] == '-' && argv[i][1]) usage();
 		else if (cpath) usage();
 		else cpath = argv[i];
 	}
 	if (!cpath) usage();
-	if (!any) want_phdrs = want_notes = 1;
+	if (!any) want_phdrs = want_notes = want_proc = 1;
 
 	int fd = open(cpath, O_RDONLY);
 	if (fd < 0) { perror(cpath); return 3; }
@@ -308,5 +380,7 @@ int main(int argc, char **argv)
 		show_segs();
 	if (want_notes)
 		show_notes();
+	if (want_proc)
+		show_prpsinfo();
 	return 0;
 }
