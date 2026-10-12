@@ -83,11 +83,24 @@ regs_of_gdb() {  # regs_of_gdb CORE BIN [thread-cmd]
 }
 regs_of_gdb $S/core.seg $S/seg > $S/gdb.regs
 $COREX --regs $S/core.seg | awk '$1=="reg"{print $2, $3}' | nz | sort > $S/cx.regs
-n=$(wc -l <$S/gdb.regs | tr -d ' ')
-if [ "$n" -eq 27 ] && cmp -s $S/gdb.regs $S/cx.regs; then
-	ok "all $n registers agree with gdb, by value"
+# Two different failures used to share one message. `[ "$n" -eq 27 ]` is a
+# guard against a vacuous comparison -- if gdb printed nothing, cmp of two
+# empty files succeeds -- but 27 is what *this* gdb prints for x86-64, and
+# gdb's register list does change between versions (fs_base and gs_base
+# joined `info registers` in 8.2). A newer gdb would have reported
+# "registers disagree with gdb" about a corex that agreed with it on every
+# register it was asked about. The guard is now a floor, which is all it has
+# to be, and the count it saw is reported either way.
+#
+# NREGS is reused for the per-thread total below, so the two cannot drift
+# apart: that one was hardcoded at 108, which is this number times 4 threads.
+NREGS=$(wc -l <$S/gdb.regs | tr -d ' ')
+if [ "$NREGS" -lt 16 ]; then
+	no "gdb printed only $NREGS registers, so the comparison proves nothing"
+elif cmp -s $S/gdb.regs $S/cx.regs; then
+	ok "all $NREGS registers agree with gdb, by value"
 else
-	no "registers disagree with gdb ($n from gdb)"; diff $S/gdb.regs $S/cx.regs | head
+	no "registers disagree with gdb ($NREGS from gdb)"; diff $S/gdb.regs $S/cx.regs | head
 fi
 
 # The comparator must be able to fail. Flip one nibble of rip in a copy of the
@@ -185,8 +198,13 @@ while [ $i -le 4 ]; do
 	fi
 	i=$((i + 1))
 done
-if [ $bad -eq 0 ] && [ $agree -eq 108 ]; then
+# 4 threads times whatever this gdb reports per thread. This was 108, i.e.
+# 4 x 27 for the gdb on the machine it was written on.
+want=$((NREGS * 4))
+if [ $bad -eq 0 ] && [ $agree -eq $want ]; then
 	ok "all $agree registers of all 4 threads agree with gdb, thread by thread"
+elif [ $bad -eq 0 ]; then
+	no "4 threads agreed but on $agree values, not the $want expected ($NREGS x 4)"
 else
 	no "$bad of 4 threads disagree with gdb on registers ($agree values matched)"
 fi
@@ -408,9 +426,20 @@ else
 	sed -n 's/^env [0-9]* //p' $S/cx.cmd | sort > $S/cx.env
 	# gdb adds COLUMNS, LINES and PWD to the inferior's environment itself, so
 	# the expected set is the 4 exported plus those 3, and nothing else.
-	printf 'COLUMNS=80\nCOREX_MARK=hello\nHOME=/nonexistent\nLC_ALL=C\nLINES=24\nPATH=/usr/bin\nPWD=%s\n' "$PWD" > $S/want.env
-	cmp -s $S/want.env $S/cx.env && ok "the environment is exactly the 7 variables that were set" || {
-		no "environment disagrees with what was exported"; diff $S/want.env $S/cx.env; }
+	#
+	# COLUMNS and LINES were pinned at 80 and 24, which are this gdb's batch
+	# defaults rather than anything corex decides. The subject here is corex
+	# recovering the environment out of the stack, so the four exported
+	# variables are compared by name and value and gdb's three by name only.
+	# Pinning gdb's idea of a terminal size would have failed the test on a
+	# gdb that sized itself differently, about a corex that was right.
+	printf 'COREX_MARK=hello\nHOME=/nonexistent\nLC_ALL=C\nPATH=/usr/bin\nPWD=%s\n' "$PWD" > $S/want.env
+	grep -v '^COLUMNS=\|^LINES=' $S/cx.env > $S/cx.env.exported
+	cmp -s $S/want.env $S/cx.env.exported && ok "the environment is exactly the 5 name=value pairs that were set" || {
+		no "environment disagrees with what was exported"; diff $S/want.env $S/cx.env.exported; }
+	# and gdb's two terminal variables are there, whatever it chose for them
+	cnames=$(sed -n 's/^\(COLUMNS\|LINES\)=.*/\1/p' $S/cx.env | sort | tr '\n' ' ')
+	chk "gdb's COLUMNS and LINES are recovered too" "$cnames" "COLUMNS LINES "
 	# psargs is the same command line truncated to 80 bytes with NULs turned
 	# into spaces, so it must be a prefix of what we reassembled.
 	psa=$($COREX --proc $S/core.args | sed -n 's/^psargs: //p')

@@ -234,7 +234,7 @@ them. It is in `PLAN.md` as the first unchecked item.
 
 ```
 $ make test
-71 passed, 0 failed, 0 skipped
+72 passed, 0 failed, 0 skipped
 ```
 
 Six cores from five programs, plus three synthesised fixtures. The suite
