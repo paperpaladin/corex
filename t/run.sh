@@ -17,6 +17,28 @@ skip() { printf 'skip  %s\n' "$1"; skip=$((skip+1)); }
 nz()   { sed 's/0x0*\([0-9a-f]\)/0x\1/g'; }   # 0x0000ab -> 0xab, so hex widths do not matter
 chk()  { if [ "$2" = "$3" ]; then ok "$1"; else no "$1: got [$2] want [$3]"; fi; }
 
+# gdb is not optional here, and the difference matters. In `trace`, strace is
+# one oracle among several, so a missing strace prints SKIP and the rest of
+# the suite still means something. In this suite gdb is the only oracle AND
+# the thing that produces the cores, so without it there is nothing to compare
+# and nothing to compare against -- and a run that reports "0 passed, 0
+# failed" having checked nothing is the exact failure this collection is about.
+#
+# There was no check at all before. A machine without gdb got a cascade of
+# "gdb: command not found" from every generator, then a wall of failures about
+# missing core files, and had to work backwards to the cause.
+for tool in gdb gcc readelf; do
+	if ! command -v "$tool" >/dev/null 2>&1; then
+		printf 'corex: %s is required and was not found.\n' "$tool" >&2
+		printf '  gdb is the oracle for every fact this suite checks AND the\n' >&2
+		printf '  only way to obtain a core here (core_pattern pipes to\n' >&2
+		printf '  systemd-coredump and cannot be changed without root), so\n' >&2
+		printf '  there is no reduced suite worth running without it.\n' >&2
+		printf '  Fedora: sudo dnf install gdb gcc binutils\n' >&2
+		exit 2
+	fi
+done
+
 CFL="-O0 -g -fno-omit-frame-pointer -mno-omit-leaf-frame-pointer -fno-inline"
 gdbb() { gdb --batch -nx -iex 'set debuginfod enabled off' "$@"; }
 
