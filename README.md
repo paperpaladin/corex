@@ -150,7 +150,7 @@ does.
   `file+0xoffset`, computed from `NT_FILE`, which is the most a core file can
   tell you on its own without opening another file. The test suite gets names
   by asking gdb `info symbol` about corex's addresses; the program never does.
-- **DWARF.** corex reads none. `dwarfdump` (sibling repo) parses DWARF 2
+- **DWARF.** corex reads none. `dbginfo` (sibling repo) parses DWARF 2
   through 5 -- compilation units, the DIE tree, the line-number program -- and
   corex does not touch any of it. So there are no source file and line numbers,
   no local variables, no inlined frames, and no CFI-based unwinding.

@@ -61,7 +61,7 @@ Ranked by how little we control them:
 
 ## Non-goals
 
-- No DWARF. `dwarfdump` (sibling repo) already parses debug info; corex does
+- No DWARF. `dbginfo` (sibling repo) already parses debug info; corex does
   not read it, so there are no source lines, no local variables, no inlined
   frames and no CFI-based unwinding.
 - No symbol table reading. `prof` (sibling repo) already resolves addresses
