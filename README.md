@@ -78,7 +78,7 @@ The second reason is that core readers fail quietly. A note iterator that pads
 one field wrong still decodes the first note. An unwinder that drops a frame
 still prints a plausible backtrace. A reader that treats memory which was
 mapped but never saved as a page of zeros still prints a hexdump. None of
-those look like failures, which is why this repo leans on an oracle for every
+those look like failures, so this repo leans on an oracle for every
 single fact it prints.
 
 ## The oracle
@@ -147,7 +147,7 @@ does.
   (sibling repo) already solved that problem, it parses `.symtab`, falls
   back to `.dynsym`, and binary-searches a sorted table, and the approach
   was deliberately **not reused or reimplemented here**. corex prints
-  `file+0xoffset`, computed from `NT_FILE`, which is the most a core file can
+  `file+0xoffset`, computed from `NT_FILE`, the most a core file can
   tell you on its own without opening another file. The test suite gets names
   by asking gdb `info symbol` about corex's addresses. The program never does.
 - DWARF. corex reads none. `dbginfo` (sibling repo) parses DWARF 2

@@ -66,7 +66,7 @@ Ranked by how little we control them:
   frames and no CFI-based unwinding.
 - No symbol table reading. `prof` (sibling repo) already resolves addresses
   to names out of `.symtab`/`.dynsym`. Corex deliberately stops at
-  `file+0xoffset`, which is what `NT_FILE` can tell you without opening
+  `file+0xoffset`, all `NT_FILE` can tell you without opening
   another file. See README.
 - x86-64 only, little-endian only, Linux only.
 - No floating point / vector registers (`NT_FPREGSET`, `NT_X86_XSTATE` are
@@ -131,7 +131,7 @@ Next, in order:
         so this is mostly a second register map.
 - [ ] sort the segment table once and binary-search it
       - why: the `shortcut:` comment in `seg_of()`. Only matters at PN_XNUM
-        scale, which is also the only shape that cannot be tested here yet.
+        scale, also the only shape that cannot be tested here yet.
 - [ ] report the thread whose `si_code` and `pr_info` disagree with
       `NT_SIGINFO`
       - why: a core where the two notes tell different stories is either a
