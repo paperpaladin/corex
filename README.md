@@ -58,14 +58,14 @@ hexdumps process memory out of the `PT_LOAD` segments.
 
 A core file is the only artefact of a crash that nobody chose the contents of.
 It is also a format almost nobody has read directly: the usual route is gdb,
-which is 200k lines of C++ and tells you what it thinks rather than what is
-there. The actual container is small -- an ELF64 header, a list of `PT_LOAD`
+which is 200k lines of C++ and tells you what it thinks, not what is
+there. The actual container is small: an ELF64 header, a list of `PT_LOAD`
 segments holding the memory, and one `PT_NOTE` segment holding everything
 else:
 
 | note | what it carries |
 |---|---|
-| `NT_PRSTATUS` | 27 registers, the signal, the thread id -- **one per thread** |
+| `NT_PRSTATUS` | 27 registers, the signal, the thread id, **one per thread** |
 | `NT_PRPSINFO` | command name, process state, pid/ppid/pgrp/sid, uid/gid |
 | `NT_SIGINFO` | the full `siginfo_t`: `si_code`, and the faulting address |
 | `NT_AUXV` | the auxiliary vector the kernel pushed at exec |
@@ -83,7 +83,7 @@ single fact it prints.
 
 ## The oracle
 
-**gdb is the authority.** It is an independent implementation, decades old,
+gdb is the authority. It is an independent implementation, decades old,
 and where we disagree we are wrong. Every fact corex prints about a core is
 compared against gdb reading the same core:
 
@@ -114,59 +114,59 @@ command line: the core is made with a chosen `argv` and, under `env -i`, an
 environment of exactly four variables.
 
 Measured here: **135 register values** (27 x 1 thread + 27 x 4 threads) and
-**1016 backtrace frames** agree with gdb, along with 15 mapped files, 18
+1016 backtrace frames agree with gdb, along with 15 mapped files, 18
 `PT_LOAD` mappings and 23 auxv entries. Nothing disagrees.
 
 ## What gdb caught
 
 Two things, and neither was visible from inside.
 
-**pr_cursig is set on every thread, not just the one that faulted.** The
+pr_cursig is set on every thread, not just the one that faulted. The
 multi-thread test asserted that exactly one thread would carry the signal.
 Four do: both `gcore` and the kernel's `fill_prstatus()` stamp the signal into
 every thread's `NT_PRSTATUS`. So "which thread died" cannot be answered by
-looking for the only thread with a signal. It is answered by position -- the
-signalled thread is written first -- and gdb's `*` in `info threads` confirms
+looking for the only thread with a signal. It is answered by position: the
+signalled thread is written first, and gdb's `*` in `info threads` confirms
 the same thread.
 
-**The backtrace is a subsequence of gdb's, not a prefix.** On the `SIGABRT`
+The backtrace is a subsequence of gdb's, not a prefix. On the `SIGABRT`
 core, gdb finds 6 frames and corex finds 2. The signal landed inside glibc,
 which is built without frame pointers, so `rbp` still points at the frame of
-`boom()` -- the last function that kept one -- and the chain steps from
+`boom()`: the last function that kept one, and the chain steps from
 `__pthread_kill_implementation` straight into `boom`, over `raise()` and
 `abort()`. The frames corex misses are in the *middle*, which the original
 "must be a prefix of gdb's" assertion could not express. The invariant is now
 that every address corex reports appears in gdb's backtrace in the same order.
 That still fails loudly on an invented frame, a reordered pair or a fabricated
-address; what it allows is the one thing frame-pointer unwinding legitimately
+address. What it allows is the one thing frame-pointer unwinding legitimately
 does.
 
 ## Where this repo stops, and which sibling went further
 
-- **Symbols.** corex does not resolve an address to a function name. `prof`
-  (sibling repo) already solved that problem -- it parses `.symtab`, falls
-  back to `.dynsym`, and binary-searches a sorted table -- and the approach
+- Symbols. corex does not resolve an address to a function name. `prof`
+  (sibling repo) already solved that problem, it parses `.symtab`, falls
+  back to `.dynsym`, and binary-searches a sorted table, and the approach
   was deliberately **not reused or reimplemented here**. corex prints
   `file+0xoffset`, computed from `NT_FILE`, which is the most a core file can
   tell you on its own without opening another file. The test suite gets names
-  by asking gdb `info symbol` about corex's addresses; the program never does.
-- **DWARF.** corex reads none. `dbginfo` (sibling repo) parses DWARF 2
-  through 5 -- compilation units, the DIE tree, the line-number program -- and
+  by asking gdb `info symbol` about corex's addresses. The program never does.
+- DWARF. corex reads none. `dbginfo` (sibling repo) parses DWARF 2
+  through 5 (compilation units, the DIE tree, the line-number program) and
   corex does not touch any of it. So there are no source file and line numbers,
   no local variables, no inlined frames, and no CFI-based unwinding.
-- **Frame-pointer unwinding** is the same mechanism `prof` walks on live perf
+- Frame-pointer unwinding is the same mechanism `prof` walks on live perf
   samples, with the same precondition for the same reason: it needs
   `-fno-omit-frame-pointer` in the code being unwound. The test programs are
   built `-fno-omit-frame-pointer -O0 -fno-inline` precisely so the correct
   backtrace is defined by the source. On an optimised binary the chain is not
-  there and the backtrace stops early -- see the `SIGABRT` case above, which
+  there and the backtrace stops early, see the `SIGABRT` case above, which
   is that limitation with glibc playing the optimised binary.
 
 ## Generating cores here, and the gap that leaves
 
-**`gcore` works in this container.** `/proc/sys/kernel/core_pattern` pipes to
+`gcore` works in this container. `/proc/sys/kernel/core_pattern` pipes to
 `systemd-coredump` and cannot be changed without real root (`unshare -r` does
-not help -- `core_pattern` is global, not namespaced), and `coredumpctl` is
+not help, `core_pattern` is global, not namespaced), and `coredumpctl` is
 not installed, so no kernel-written core is reachable. Every core in the test
 suite is therefore made by letting the program die under gdb and calling
 `gcore` on the stopped inferior, which needs no root and touches no sysctl.
@@ -176,7 +176,7 @@ This works and the cores are complete: registers, `NT_SIGINFO` with the real
 What it does not give is two shapes a kernel core has and `gcore` never
 produces, so both are synthesised by rewriting a valid core:
 
-- **`p_filesz == 0` segments.** The kernel's default
+- `p_filesz == 0` segments. The kernel's default
   `/proc/PID/coredump_filter` is `0x33`, which excludes file-backed private
   pages, so in a real kernel core every shared library's text segment is a
   `PT_LOAD` that existed but whose contents were not saved. `gcore` instead
@@ -184,50 +184,50 @@ produces, so both are synthesised by rewriting a valid core:
   entirely. `t/run.sh` builds `core.filesz0` by zeroing `p_filesz` on the ten
   file-backed read-only segments, and gdb's `maint info sections` agrees with
   corex about which ten have no contents.
-- **`PN_XNUM`.** More than 65534 mappings, so `e_phnum` is `0xffff` and the
+- `PN_XNUM`. More than 65534 mappings, so `e_phnum` is `0xffff` and the
   real count lives in section header 0's `sh_info`. `core.xnum` is a valid
   core re-encoded that way; `readelf` and corex both read 19 from it.
 
-**This is a real gap and it is not closed.** corex has never been run on a
+This is a real gap and it is not closed. corex has never been run on a
 core this kernel wrote, only on cores gdb wrote and on fixtures derived from
 them. It is in `PLAN.md` as the first unchecked item.
 
 ## What does not work
 
-- **x86-64 little-endian Linux only.** 32-bit cores, big-endian cores and
+- x86-64 little-endian Linux only. 32-bit cores, big-endian cores and
   other architectures are rejected at the ELF header, not mis-parsed. There is
   no `Elf32` path, and `pr_reg` is read as a `user_regs_struct` whose field
   order is specific to x86-64.
-- **No symbol names, no source lines, no local variables, no inlined frames,
-  no CFI unwinding.** See the section above.
-- **Frame pointers are required** for the backtrace. Without them it stops
+- No symbol names, no source lines, no local variables, no inlined frames,
+  no CFI unwinding. See the section above.
+- Frame pointers are required for the backtrace. Without them it stops
   early or skips frames, and says which.
-- **No floating point or vector registers.** `NT_FPREGSET`, `NT_X86_XSTATE`
+- No floating point or vector registers. `NT_FPREGSET`, `NT_X86_XSTATE`
   and `NT_PRXFPREG` are listed by `--notes` with their sizes and not decoded.
   Neither is `NT_GDB_TDESC`, which is gdb's XML target description and not
   part of the kernel's format.
-- **The command line and the environment are recovered heuristically.** No
+- The command line and the environment are recovered heuristically. No
   note carries them (`pr_psargs` is 80 bytes of the command line with the NULs
   turned into spaces, which cannot be split back into arguments). corex finds
   the initial stack frame by searching the stack segment for the bytes of the
   `NT_AUXV` note, then counts backwards: `envp`'s NULL terminator sits
   immediately below auxv, `argv`'s below that, and `argc` is the slot that
   holds exactly the number of `argv` pointers just counted. It reports
-  `cmdline: not recoverable` rather than guessing if the auxv block is not
+  `cmdline: not recoverable` instead of guessing if the auxv block is not
   found, is found twice, or the terminators are not where they should be. A
   program that overwrites its own initial stack frame, or a core whose stack
   segment is absent, loses both.
-- **No threads beyond `NT_PRSTATUS`.** Thread names (`/proc/PID/task/*/comm`)
+- No threads beyond `NT_PRSTATUS`. Thread names (`/proc/PID/task/*/comm`)
   are not in the core; pthread-level state is not reconstructed; there is no
   `info threads`-style frame summary.
-- **The dead process's files are never opened.** corex reads the core and
+- The dead process's files are never opened. corex reads the core and
   nothing else, so it cannot disassemble, cannot check whether the binary on
   disk still matches, and cannot symbolise.
-- **No compressed or split cores**, no `ELF_CORE_WRITE_EXTRA`, no vDSO
+- No compressed or split cores, no `ELF_CORE_WRITE_EXTRA`, no vDSO
   decoding, no `NT_TASKSTRUCT`.
-- **Overlapping `PT_LOAD` segments** resolve to the first match in file order.
+- Overlapping `PT_LOAD` segments resolve to the first match in file order.
   Real cores do not have them, and corex does not complain.
-- `-x` is the only way to read memory; there is no expression evaluator, no
+- `-x` is the only way to read memory. There is no expression evaluator, no
   typed inspection, nothing that needs to know what a pointer points at.
 
 ## `make test`
@@ -248,8 +248,8 @@ valid core (every 4 bytes through the ELF header, every program header entry,
 40 points through the `PT_NOTE` segment), one flipped bit in each of the 1128
 bytes of the ELF header and program header table, and 400 seeded random bit
 flips in the notes. Every one must exit 0 or 1 inside the timeout, and any
-truncation that reaches into the notes must be *diagnosed* rather than
-quietly producing a shorter report. 43 distinct diagnostics come out of that.
+truncation that reaches into the notes must be *diagnosed*,
+not quietly producing a shorter report. 43 distinct diagnostics come out of that.
 
 ```
 make test-asan     # the whole suite again under -fsanitize=address,undefined
@@ -265,21 +265,21 @@ truncated core, and the sweep goes red with `('truncate', 100, -11)`.
 ### Harness bugs found while building this
 
 Recorded because the method says to: five of the defects in this repo were in
-the test suite rather than in the program, and a suite that passes while
+the test suite, not in the program, and a suite that passes while
 testing nothing is the expensive kind of green.
 
-1. `strtonum()` in an awk pipeline -- mawk does not have it, so the extracted
+1. `strtonum()` in an awk pipeline, mawk does not have it, so the extracted
    `PT_LOAD` table was empty. It failed only because the readelf side was not.
 2. `readelf -n` expands `NT_FILE` into one indented line per mapping, and the
    note-list extractor matched those too, reporting 15 extra notes.
 3. `grep -c LWP` counted gdb's four `[New LWP n]` progress lines as threads,
-   giving 9; and the tid extractor also matched gdb's `[Current thread is ...]`
+   giving 9, and the tid extractor also matched gdb's `[Current thread is ...]`
    line, reporting the main thread twice.
 4. `sub("->", " ", $2)` in awk rewrote gdb's `0xa->0xb` inside field 2 without
    re-splitting the record, so every column after it was off by one and the
    comparison checked the literal string `at` against an address.
 5. The embedded fixture builder was pasted in with one tab of indentation, so
-   python died with `IndentationError`, produced nothing -- and three tests
+   python died with `IndentationError`, produced nothing, and three tests
    still went green against **stale fixtures left in `scratch/` by an earlier
    run**. The suite now deletes the fixtures first and aborts if the builder
    fails.

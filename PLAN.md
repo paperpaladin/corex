@@ -45,27 +45,27 @@ mutation sweep, and by running the whole suite again under
 
 Ranked by how little we control them:
 
-1. **gdb** (16.3, independent implementation, decades old) reading the same
+1. gdb (16.3, independent implementation, decades old) reading the same
    core file: `info registers`, `bt`, `info threads`, `info proc mappings`,
    `p $_siginfo`, `info auxv`, `x/` on memory, `info symbol` for naming our
    frame addresses. Authoritative for everything about process state.
-2. **readelf** for the ELF container: program header count, and the vaddr /
+2. readelf for the ELF container: program header count, and the vaddr /
    filesz / memsz of every `PT_LOAD`.
-3. **The source of the test programs.** `t/seg.c` is a call chain exactly four
+3. The source of the test programs. `t/seg.c` is a call chain exactly four
    deep; `t/buf.c` plants a 64 KiB buffer of known bytes on the stack and
    prints its address; `t/threads.c` parks three threads in three named
    functions. The right answer is known before any tool runs.
-4. **The kernel**, for the thread ids: `t/threads.c` prints its own
+4. The kernel, for the thread ids: `t/threads.c` prints its own
    `gettid()` values, so the tid set in the core is checked against what the
    process itself said.
 
 ## Non-goals
 
-- No DWARF. `dbginfo` (sibling repo) already parses debug info; corex does
+- No DWARF. `dbginfo` (sibling repo) already parses debug info. Corex does
   not read it, so there are no source lines, no local variables, no inlined
   frames and no CFI-based unwinding.
 - No symbol table reading. `prof` (sibling repo) already resolves addresses
-  to names out of `.symtab`/`.dynsym`; corex deliberately stops at
+  to names out of `.symtab`/`.dynsym`. Corex deliberately stops at
   `file+0xoffset`, which is what `NT_FILE` can tell you without opening
   another file. See README.
 - x86-64 only, little-endian only, Linux only.
