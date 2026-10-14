@@ -59,7 +59,7 @@ hexdumps process memory out of the `PT_LOAD` segments.
 A core file is the only artefact of a crash that nobody chose the contents of.
 It is also a format almost nobody has read directly. The usual route is gdb,
 which is 200k lines of C++ and tells you what it thinks, not what is
-there. The actual container is small: an ELF64 header, a list of `PT_LOAD`
+there. Its container is small: an ELF64 header, a list of `PT_LOAD`
 segments holding the memory, and one `PT_NOTE` segment holding everything
 else:
 
@@ -109,8 +109,8 @@ The third oracle is the source of the test programs, which fixes the answer
 before any tool runs: `t/seg.c` is a call chain exactly four deep, `t/deep.c`
 is 1000 deep, `t/buf.c` plants 64 KiB of known bytes on the stack and prints
 the address, `t/threads.c` parks three threads in three named functions and
-prints its own `gettid()` for each. The fourth is the test itself, for the
-command line. The core is made with a chosen `argv` and, under `env -i`, an
+prints its own `gettid()` for each. Fourth is the test itself, for the
+command line. Each core is made with a chosen `argv` and, under `env -i`, an
 environment of exactly four variables.
 
 Measured here: **135 register values** (27 x 1 thread + 27 x 4 threads) and
@@ -134,9 +134,8 @@ core, gdb finds 6 frames and corex finds 2. The signal landed inside glibc,
 which is built without frame pointers, so `rbp` still points at the frame of
 `boom()`: the last function that kept one, and the chain steps from
 `__pthread_kill_implementation` straight into `boom`, over `raise()` and
-`abort()`. The frames corex misses are in the *middle*, which the original
-"must be a prefix of gdb's" assertion could not express. The invariant is now
-that every address corex reports appears in gdb's backtrace in the same order.
+`abort()`. Frames corex misses are in the *middle*, which the original
+"must be a prefix of gdb's" assertion could not express. Now the invariant is that every address corex reports appears in gdb's backtrace in the same order.
 That still fails loudly on an invented frame, a reordered pair or a fabricated
 address. What it allows is the one thing frame-pointer unwinding legitimately
 does.
@@ -149,7 +148,7 @@ does.
   was deliberately **not reused or reimplemented here**. corex prints
   `file+0xoffset`, computed from `NT_FILE`, the most a core file can
   tell you on its own without opening another file. The test suite gets names
-  by asking gdb `info symbol` about corex's addresses. The program never does.
+  by asking gdb `info symbol` about corex's addresses. It never does.
 - DWARF. corex reads none. `dbginfo` (sibling repo) parses DWARF 2
   through 5 (compilation units, the DIE tree, the line-number program) and
   corex does not touch any of it. So there are no source file and line numbers,
@@ -281,7 +280,7 @@ testing nothing is the expensive kind of green.
 5. The embedded fixture builder was pasted in with one tab of indentation, so
    python died with `IndentationError`, produced nothing, and three tests
    still went green against **stale fixtures left in `scratch/` by an earlier
-   run**. The suite now deletes the fixtures first and aborts if the builder
+   run**. Now the suite deletes the fixtures first and aborts if the builder
    fails.
 6. Making the identity line unconditional broke six comparisons at once,
    because their awk programs took fields positionally from every line of
