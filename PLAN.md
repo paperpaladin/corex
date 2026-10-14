@@ -23,7 +23,7 @@ the state of the dead process:
 Sections: `--signal --proc --regs --threads --maps --files --auxv --cmdline
 --notes --bt`, or all of them by default.
 
-Pure C11 + gcc. No libelf, no libbfd, no libunwind, no libdwarf: the bytes are
+Pure C11 + gcc. No libelf, no libbfd, no libunwind, no libdwarf. The bytes are
 parsed here. gdb is the test oracle and is never linked, called or required by
 the program.
 

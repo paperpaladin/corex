@@ -57,7 +57,7 @@ hexdumps process memory out of the `PT_LOAD` segments.
 ## Why this exists
 
 A core file is the only artefact of a crash that nobody chose the contents of.
-It is also a format almost nobody has read directly: the usual route is gdb,
+It is also a format almost nobody has read directly. The usual route is gdb,
 which is 200k lines of C++ and tells you what it thinks, not what is
 there. The actual container is small: an ELF64 header, a list of `PT_LOAD`
 segments holding the memory, and one `PT_NOTE` segment holding everything
@@ -110,7 +110,7 @@ before any tool runs: `t/seg.c` is a call chain exactly four deep, `t/deep.c`
 is 1000 deep, `t/buf.c` plants 64 KiB of known bytes on the stack and prints
 the address, `t/threads.c` parks three threads in three named functions and
 prints its own `gettid()` for each. The fourth is the test itself, for the
-command line: the core is made with a chosen `argv` and, under `env -i`, an
+command line. The core is made with a chosen `argv` and, under `env -i`, an
 environment of exactly four variables.
 
 Measured here: **135 register values** (27 x 1 thread + 27 x 4 threads) and
@@ -125,7 +125,7 @@ pr_cursig is set on every thread, not just the one that faulted. The
 multi-thread test asserted that exactly one thread would carry the signal.
 Four do: both `gcore` and the kernel's `fill_prstatus()` stamp the signal into
 every thread's `NT_PRSTATUS`. So "which thread died" cannot be answered by
-looking for the only thread with a signal. It is answered by position: the
+looking for the only thread with a signal. It is answered by position. The
 signalled thread is written first, and gdb's `*` in `info threads` confirms
 the same thread.
 
@@ -155,7 +155,7 @@ does.
   corex does not touch any of it. So there are no source file and line numbers,
   no local variables, no inlined frames, and no CFI-based unwinding.
 - Frame-pointer unwinding is the same mechanism `prof` walks on live perf
-  samples, with the same precondition for the same reason: it needs
+  samples, with the same precondition for the same reason. It needs
   `-fno-omit-frame-pointer` in the code being unwound. The test programs are
   built `-fno-omit-frame-pointer -O0 -fno-inline` precisely so the correct
   backtrace is defined by the source. On an optimised binary the chain is not
@@ -256,7 +256,7 @@ make test-asan     # the whole suite again under -fsanitize=address,undefined
 make valgrind      # valgrind -q --error-exitcode=9 on every core and fixture
 ```
 
-Both clean. These are not decoration: a core file is attacker-controlled
+Both clean. These are not decoration. A core file is attacker-controlled
 binary whose own fields decide how far each read goes, and a one-byte overread
 is invisible without them. With `in_file()` stubbed to `return 1`, ASan
 reports `SEGV on unknown address ... #0 u32 corex.c:65` on a 100-byte
