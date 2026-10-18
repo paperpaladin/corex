@@ -369,6 +369,14 @@ struct thread {
 	int32_t pid, ppid, pgrp, sid;
 	int32_t cursig, si_signo, si_code, si_errno;
 	uint64_t reg[NGREG];
+	/* The FXSAVE area from NT_FPREGSET, verbatim, and whether there
+	 * was one. A thread can have registers and no FP note: gcore
+	 * writes NT_FPREGSET per thread, but a core from another
+	 * producer need not, and printing zeros for a note that is not
+	 * there would be inventing register values. */
+	const uint8_t *fx;
+	/* The YMM upper halves from NT_X86_XSTATE, or NULL. */
+	const uint8_t *ymmh;
 };
 
 static struct thread *threads;
@@ -394,6 +402,75 @@ static uint64_t reg_by_name(const struct thread *t, const char *n)
 			return t->reg[REGMAP[i].i];
 	die("no register named %s", n);
 	return 0;
+}
+
+/* ---- NT_FPREGSET and NT_X86_XSTATE --------------------------------------
+ *
+ * NT_FPREGSET is a struct user_fpregs_struct, which is the 512-byte
+ * FXSAVE area: control words first, then eight 80-bit x87 registers in
+ * 16-byte slots, then sixteen 128-bit SSE registers.
+ *
+ * NT_X86_XSTATE is the XSAVE area, which begins with that same 512
+ * bytes and continues with a 64-byte header and then one component per
+ * set bit in xstate_bv. The only component decoded here is YMM_Hi128,
+ * the upper halves of ymm0..15, which in the standard layout sits at a
+ * fixed offset of 576. A compacted XSAVE area puts components
+ * elsewhere, and the bit that says so is bit 63 of xcomp_bv: it is
+ * checked and the component is skipped rather than read from the wrong
+ * place, because reading it from the wrong place produces sixteen
+ * plausible 128-bit numbers and no error.
+ *
+ * shortcut: only YMM_Hi128. ZMM, the opmask registers and the rest of
+ * AVX-512 are listed by --notes and not decoded. Each needs its offset
+ * from the CPUID leaf the producing machine had, which is not in the
+ * core, so the standard offsets are an assumption rather than a fact.
+ */
+#define FXSAVE_SZ	512
+#define XSTATE_HDR	512	/* xstate_bv at +0, xcomp_bv at +8 */
+#define XSTATE_YMMH	576	/* standard, non-compacted layout */
+#define XSTATE_MIN	(XSTATE_YMMH + 256)
+#define XFEATURE_YMM	(1ULL << 2)
+
+/* Attach the FP notes to the thread they belong to. They arrive in the
+ * same order as the NT_PRSTATUS notes, one set per thread, which is
+ * what the kernel and gcore both write. Matched by position for that
+ * reason: the notes carry no tid of their own, so there is nothing
+ * else to match on, and a core whose note order did not follow that
+ * convention would be silently misattributed. Counted rather than
+ * assumed: a mismatch in the number of notes is reported.
+ */
+static void load_fpregs(void)
+{
+	unsigned nfp = 0, nxs = 0;
+
+	for (unsigned i = 0; i < nnotes; i++) {
+		if (!nameis(&notes[i], "CORE") && !nameis(&notes[i], "LINUX"))
+			continue;
+		if (notes[i].type == NT_PRFPREG) {
+			if (notes[i].descsz < FXSAVE_SZ)
+				die("NT_FPREGSET note %u is %" PRIu64 " bytes, want at least %u",
+				    nfp, notes[i].descsz, FXSAVE_SZ);
+			if (nfp < nthreads)
+				threads[nfp].fx = notes[i].desc;
+			nfp++;
+		} else if (notes[i].type == NT_X86_XSTATE) {
+			const uint8_t *d = notes[i].desc;
+			if (notes[i].descsz >= XSTATE_MIN &&
+			    !(u64(d + XSTATE_HDR + 8) >> 63) &&
+			    (u64(d + XSTATE_HDR) & XFEATURE_YMM)) {
+				if (nxs < nthreads)
+					threads[nxs].ymmh = d + XSTATE_YMMH;
+			}
+			nxs++;
+		}
+	}
+
+	if (nfp && nfp != nthreads)
+		die("%u NT_FPREGSET notes for %u threads: they cannot be matched by position",
+		    nfp, nthreads);
+	if (nxs && nxs != nthreads)
+		die("%u NT_X86_XSTATE notes for %u threads: they cannot be matched by position",
+		    nxs, nthreads);
 }
 
 static void load_threads(void)
@@ -422,6 +499,7 @@ static void load_threads(void)
 	}
 	if (!nthreads)
 		die("no NT_PRSTATUS note: no thread state in this core");
+	load_fpregs();
 }
 
 static const char *signame(int s)
@@ -518,6 +596,70 @@ static void show_signal(void)
 	}
 }
 
+/* 128 bits printed as gdb's uint128 field prints them: one hex number,
+ * high half first, no separator. A 64-bit decoder would pass a
+ * comparison against a zeroed register and fail here only if the
+ * fixture's values differ in both halves, which is why they do. */
+static void print_u128(const char *name, const uint8_t *p)
+{
+	printf("fpreg %s 0x%016" PRIx64 "%016" PRIx64 "\n",
+	       name, u64(p + 8), u64(p));
+}
+
+static void show_fpregs(const struct thread *t)
+{
+	if (!t->fx) {
+		printf("fpreg none (no NT_FPREGSET note for this thread)\n");
+		return;
+	}
+	const uint8_t *f = t->fx;
+
+	printf("fpreg fctrl 0x%x\n", u16(f));
+	printf("fpreg fstat 0x%x\n", u16(f + 2));
+	/* The FXSAVE abridged tag byte, which is not the x87 tag word
+	 * gdb prints. gdb reconstructs the 16-bit word from it, and this
+	 * prints what is actually in the note, named differently so the
+	 * two are not mistaken for each other. */
+	printf("fpreg ftag_abridged 0x%x\n", f[4]);
+	printf("fpreg fop 0x%x\n", u16(f + 6));
+	printf("fpreg fip 0x%" PRIx64 "\n", u64(f + 8));
+	printf("fpreg fdp 0x%" PRIx64 "\n", u64(f + 16));
+	printf("fpreg mxcsr 0x%x\n", u32(f + 24));
+	printf("fpreg mxcsr_mask 0x%x\n", u32(f + 28));
+
+	/* The x87 stack: eight 80-bit values in 16-byte slots, printed
+	 * as the 80 raw bits, which is the form gdb's "(raw 0x...)"
+	 * shows. The six bytes of padding after each are not printed
+	 * because they are not defined to be anything. */
+	for (int i = 0; i < 8; i++) {
+		const uint8_t *p = f + 32 + 16 * i;
+		printf("fpreg st%d 0x%04x%016" PRIx64 "\n", i, u16(p + 8), u64(p));
+	}
+
+	for (int i = 0; i < 16; i++) {
+		char n[8];
+		snprintf(n, sizeof n, "xmm%d", i);
+		print_u128(n, f + 160 + 16 * i);
+	}
+
+	if (!t->ymmh) {
+		printf("fpreg ymm none (no usable NT_X86_XSTATE note)\n");
+		return;
+	}
+	/* ymm is the xmm register with the upper half from the XSTATE
+	 * component appended, so it is printed whole rather than as a
+	 * second set of half registers nobody has to assemble. */
+	for (int i = 0; i < 16; i++) {
+		uint8_t whole[32];
+		memcpy(whole, f + 160 + 16 * i, 16);
+		memcpy(whole + 16, t->ymmh + 16 * i, 16);
+		printf("fpreg ymm%d 0x%016" PRIx64 "%016" PRIx64
+		       "%016" PRIx64 "%016" PRIx64 "\n", i,
+		       u64(whole + 24), u64(whole + 16),
+		       u64(whole + 8), u64(whole));
+	}
+}
+
 static void show_threads(int regs)
 {
 	printf("threads: %u\n", nthreads);
@@ -531,6 +673,8 @@ static void show_threads(int regs)
 		for (int r = 0; r < NGREG; r++)
 			printf("reg %s 0x%" PRIx64 "\n", REGMAP[r].name,
 			       t->reg[REGMAP[r].i]);
+		if (regs > 1)
+			show_fpregs(t);
 	}
 }
 
@@ -1001,7 +1145,7 @@ static void show_cmdline(void)
 
 static void usage(void)
 {
-	fputs("usage: corex [--phdrs] [--notes] [--proc] [--signal] [--threads]\n             [--regs] [--auxv] [--files] [--maps] [--bt] [--cmdline]\n             [-x ADDR[,LEN]] [--all] CORE\n", stderr);
+	fputs("usage: corex [--phdrs] [--notes] [--proc] [--signal] [--threads]\n             [--regs] [--fpregs] [--auxv] [--files] [--maps] [--bt] [--cmdline]\n             [-x ADDR[,LEN]] [--all] CORE\n", stderr);
 	exit(2);
 }
 
@@ -1020,6 +1164,7 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[i], "--signal")) { want_sig = any = 1; }
 		else if (!strcmp(argv[i], "--threads")) { want_threads = any = 1; }
 		else if (!strcmp(argv[i], "--regs")) { want_regs = want_threads = any = 1; }
+		else if (!strcmp(argv[i], "--fpregs")) { want_regs = 2; want_threads = any = 1; }
 		else if (!strcmp(argv[i], "--auxv")) { want_auxv = any = 1; }
 		else if (!strcmp(argv[i], "--files")) { want_files = any = 1; }
 		else if (!strcmp(argv[i], "--maps")) { want_maps = any = 1; }

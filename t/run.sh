@@ -742,6 +742,195 @@ $COREX / >/dev/null 2>&1; chk "a directory is rejected (exit 1)" "$?" "1"
 : > $S/empty; $COREX $S/empty >/dev/null 2>&1; chk "an empty file is rejected (exit 1)" "$?" "1"
 $COREX --all $S/core.seg >/dev/null 2>&1; chk "--all succeeds on a good core (exit 0)" "$?" "0"
 
+# -- NT_FPREGSET and NT_X86_XSTATE, against gdb ---------------------------
+#
+# The fixture exists because of a vacuous test, not because the other
+# cores are unsuitable. Every one of them leaves xmm, the x87 stack and
+# mxcsr at their startup values, which are zero or constant, and a
+# decoder reading the wrong offset inside 512 bytes of zeros produces
+# exactly the right answer. A comparison on such a core passes with two
+# registers swapped, with the note read from the wrong place, or with
+# the decoder returning a zero it never looked up.
+#
+# t/fpregs.c sets all sixteen xmm registers, all eight x87 slots and
+# mxcsr to distinct values, distinct in BOTH 64-bit halves, so a
+# decoder reading 8 bytes where it needs 16 fails too.
+if gen fpregs; then
+	ok "gcore: wrote a core with non-default FP state"
+	F=$S/core.fpregs
+
+	# What gdb says. uint128 for the SSE registers, the raw 80 bits
+	# for the x87 ones, which is the form gdb itself prints.
+	# The argument list is built in a subshell with set --, not piped
+	# through xargs: gdbb is a shell function and xargs cannot invoke
+	# one. The first version did that and gdb was never run at all,
+	# which the suite reported as "gdb printed 0 xmm registers"
+	# rather than as agreement, because the count guard was there.
+	(
+		i=0; while [ $i -lt 16 ]; do
+			set -- "$@" -ex "p/x \$xmm$i.uint128"; i=$((i+1))
+		done
+		gdbb $S/fpregs $F "$@" 2>/dev/null
+	) | sed -n 's/^\$[0-9]* = 0x/0x/p' > $S/gdb.xmm
+
+	$COREX --fpregs $F | awk '$1=="fpreg" && $2 ~ /^xmm/ {print $2, $3}' > $S/cx.xmm
+	# gdb strips leading zeros and corex pads to 32 digits, so both
+	# sides are normalised rather than one being made to imitate the
+	# other.
+	norm128() { sed 's/ 0x0*/ 0x/' | sed 's/ 0x$/ 0x0/'; }
+	awk -v n=0 '{printf "xmm%d %s\n", n++, $0}' $S/gdb.xmm | norm128 > $S/gdb.xmm.n
+	norm128 < $S/cx.xmm > $S/cx.xmm.n
+
+	nx=$(wc -l <$S/gdb.xmm.n | tr -d ' ')
+	# The comparison is worthless if gdb printed nothing, and equally
+	# worthless if every value is zero: that is the state this fixture
+	# exists to avoid, so it is asserted rather than assumed.
+	zeros=$(awk '$2 == "0x0"' $S/gdb.xmm.n | wc -l | tr -d ' ')
+	if [ "$nx" -ne 16 ]; then
+		no "gdb printed $nx xmm registers, want 16"
+	elif [ "$zeros" -gt 2 ]; then
+		no "$zeros of 16 xmm registers are zero, so this comparison proves little"
+	elif cmp -s $S/gdb.xmm.n $S/cx.xmm.n; then
+		ok "all 16 xmm registers agree with gdb, by value"
+	else
+		no "xmm registers disagree with gdb"; diff $S/gdb.xmm.n $S/cx.xmm.n | head -6
+	fi
+
+	# The x87 stack, as the raw 80 bits gdb prints in parentheses.
+	(
+		i=0; while [ $i -lt 8 ]; do
+			set -- "$@" -ex "info registers st$i"; i=$((i+1))
+		done
+		gdbb $S/fpregs $F "$@" 2>/dev/null
+	) | sed -n 's/^st\([0-7]\).*(raw \(0x[0-9a-f]*\))/st\1 \2/p' | sort > $S/gdb.st
+	$COREX --fpregs $F | awk '$1=="fpreg" && $2 ~ /^st[0-7]$/ {print $2, $3}' | sort > $S/cx.st
+	ns=$(wc -l <$S/gdb.st | tr -d ' ')
+	if [ "$ns" -ne 8 ]; then
+		no "gdb printed $ns x87 registers, want 8"
+	elif cmp -s $S/gdb.st $S/cx.st; then
+		ok "all 8 x87 registers agree with gdb, raw 80 bits each"
+	else
+		no "x87 registers disagree with gdb"; diff $S/gdb.st $S/cx.st | head -6
+	fi
+
+	# mxcsr, which the fixture sets to the default plus FZ so that a
+	# decoder returning the constant 0x1f80 is caught.
+	want=$(gdbb $S/fpregs $F -ex 'p/x $mxcsr' 2>/dev/null | sed -n 's/^\$1 = //p')
+	got=$($COREX --fpregs $F | awk '$1=="fpreg" && $2=="mxcsr"{print $3; exit}')
+	chk "mxcsr agrees with gdb" "$got" "$want"
+	if [ "$want" = "0x1f80" ]; then
+		no "mxcsr is the default, so this case cannot tell a constant from a read"
+	else
+		ok "mxcsr is not the default value ($want), so the read is observable"
+	fi
+
+	# ymm, which needs NT_X86_XSTATE. Skipped loudly where the note is
+	# absent or compacted rather than reported as agreement.
+	if $COREX --fpregs $F | grep -q '^fpreg ymm none'; then
+		skip "no usable NT_X86_XSTATE note in this core, so ymm was not compared"
+	else
+		(
+			i=0; while [ $i -lt 16 ]; do
+				set -- "$@" -ex "p/x \$ymm$i.v2_int128"; i=$((i+1))
+			done
+			gdbb $S/fpregs $F "$@" 2>/dev/null
+		) | sed -n 's/^\$[0-9]* = {\(0x[0-9a-f]*\), \(0x[0-9a-f]*\)}/\2 \1/p' > $S/gdb.ymm.raw
+		# gdb prints {low, high}; join them high first, which is how a
+		# 256-bit number is written and how corex prints it.
+		awk -v n=0 '{h=$1; l=$2; sub(/^0x/,"",h); sub(/^0x/,"",l);
+			printf "ymm%d 0x%s%s\n", n++, h, l}' $S/gdb.ymm.raw | norm128 > $S/gdb.ymm
+		$COREX --fpregs $F | awk '$1=="fpreg" && $2 ~ /^ymm[0-9]/ {print $2, $3}' |
+			norm128 > $S/cx.ymm
+		ny=$(wc -l <$S/gdb.ymm | tr -d ' ')
+		if [ "$ny" -ne 16 ]; then
+			no "gdb printed $ny ymm registers, want 16"
+		elif cmp -s $S/gdb.ymm $S/cx.ymm; then
+			ok "all 16 ymm registers agree with gdb, 256 bits each"
+		else
+			no "ymm registers disagree with gdb"; diff $S/gdb.ymm $S/cx.ymm | head -6
+		fi
+	fi
+
+	# A compacted XSAVE area, which gcore does not produce here, so
+	# the guard against one is unreachable with any core this suite
+	# can make and a mutation deleting it survives. Constructed
+	# instead: bit 63 of xcomp_bv set in a copy. corex must say it
+	# has no usable note rather than read YMM_Hi128 from offset 576,
+	# which in a compacted area holds something else entirely and
+	# would produce sixteen plausible numbers and no error.
+	cat > $S/xcomp.py <<'PY'
+import struct, sys
+b = bytearray(open(sys.argv[1], 'rb').read())
+phoff, = struct.unpack_from('<Q', b, 0x20)
+psz, pn = struct.unpack_from('<HH', b, 0x36)
+seg = [struct.unpack_from('<IIQQQQQQ', b, phoff + i * psz) for i in range(pn)]
+seg = [x for x in seg if x[0] == 4][0]
+o, end = seg[2], seg[2] + seg[5]
+hit = 0
+while o + 12 <= end:
+    nsz, dsz, typ = struct.unpack_from('<III', b, o)
+    desc = o + 12 + ((nsz + 3) // 4) * 4
+    if typ == 0x202 and dsz >= 576:
+        v, = struct.unpack_from('<Q', b, desc + 520)
+        struct.pack_into('<Q', b, desc + 520, v | (1 << 63))
+        hit += 1
+    o = desc + ((dsz + 3) // 4) * 4
+open(sys.argv[2], 'wb').write(b)
+print(hit)
+PY
+	nhit=$(python3 $S/xcomp.py $F $S/core.xcomp)
+	if [ "$nhit" -lt 1 ]; then
+		skip "no NT_X86_XSTATE note to mark compacted"
+	elif $COREX --fpregs $S/core.xcomp | grep -q '^fpreg ymm none'; then
+		ok "a compacted XSAVE area is declined, not read at the standard offset"
+	else
+		no "a compacted XSAVE area was read as if it were standard"
+	fi
+
+	# The comparator must be able to fail. One nibble of the FXSAVE
+	# area, in a copy, and the xmm check has to notice: a suite that
+	# cannot fail is the most expensive kind of green.
+	# The file offset of the NT_FPREGSET descriptor, found by walking
+	# PT_NOTE the same way the truncation case below does. --notes
+	# prints the descriptor SIZE, not its offset, which is what the
+	# first version of this read.
+	#
+	# In a file rather than a heredoc inside $( ): dash mis-parses
+	# that combination and the error it gives is "fi unexpected" two
+	# hundred lines away.
+	cat > $S/fpoff.py <<'PY'
+import struct, sys
+b = open(sys.argv[1], 'rb').read()
+phoff, = struct.unpack_from('<Q', b, 0x20)
+psz, pn = struct.unpack_from('<HH', b, 0x36)
+seg = [struct.unpack_from('<IIQQQQQQ', b, phoff + i * psz) for i in range(pn)]
+seg = [x for x in seg if x[0] == 4][0]
+o, end = seg[2], seg[2] + seg[5]
+while o + 12 <= end:
+    nsz, dsz, typ = struct.unpack_from('<III', b, o)
+    desc = o + 12 + ((nsz + 3) // 4) * 4
+    if typ == 2:
+        print(desc)
+        break
+    o = desc + ((dsz + 3) // 4) * 4
+PY
+	off=$(python3 $S/fpoff.py $F)
+	if [ -n "$off" ]; then
+		cp $F $S/core.fpbad
+		printf '\xff' | dd of=$S/core.fpbad bs=1 seek=$((off + 160)) \
+			conv=notrunc status=none
+		$COREX --fpregs $S/core.fpbad |
+			awk '$1=="fpreg" && $2 ~ /^xmm/ {print $2, $3}' | norm128 > $S/bad.xmm
+		if cmp -s $S/cx.xmm.n $S/bad.xmm; then
+			no "flipping a byte of the FXSAVE area changed nothing, so the decoder is not reading it"
+		else
+			ok "flipping one byte of the FXSAVE area changes what is printed"
+		fi
+	else
+		no "could not locate the NT_FPREGSET descriptor in the file"
+	fi
+fi
+
 # -- rejecting what is not a core ------------------------------------------
 $COREX corex.c >/dev/null 2>$S/err; rc=$?
 chk "a C source file is rejected (exit 1)" "$rc" "1"

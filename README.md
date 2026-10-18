@@ -191,6 +191,47 @@ This is a real gap and it is not closed. corex has never been run on a
 core this kernel wrote, only on cores gdb wrote and on fixtures derived from
 them. It is in `PLAN.md` as the first unchecked item.
 
+## Floating point, and a fixture that exists because of a vacuous test
+
+`--fpregs` decodes `NT_FPREGSET`, the 512-byte FXSAVE area, and the
+`YMM_Hi128` component of `NT_X86_XSTATE`: control words, eight x87
+registers as their raw 80 bits, sixteen xmm registers, and ymm0..15
+assembled from the two halves. Every one of them agrees with gdb.
+
+The interesting part is not the decoder, it is `t/fpregs.c`. Every
+other core in this suite leaves xmm, the x87 stack and mxcsr at their
+startup values, which are zero or constant. A decoder reading the
+wrong offset inside 512 bytes of zeros produces exactly the right
+answer, so a comparison against gdb on those cores passes with two
+registers swapped, with the note read from the wrong place, or with a
+decoder that returns a zero it never looked up.
+
+So the fixture sets all sixteen xmm registers, all eight x87 slots and
+mxcsr to distinct values, distinct in **both** 64-bit halves, so a
+decoder reading 8 bytes where it needs 16 fails too. The suite then
+asserts that no more than two xmm registers came back zero and that
+mxcsr is not its default, because a fixture that quietly stopped
+setting them would put the comparison back where it started and
+nothing would say so.
+
+Two naming decisions worth stating. The abridged FXSAVE tag byte is
+printed as `ftag_abridged` and not as `ftag`: gdb reconstructs the
+16-bit x87 tag word from it and prints that, while the note holds the
+8-bit form, and giving both the same name invites a comparison
+between two different quantities. And a **compacted** XSAVE area is
+declined rather than read at the standard offset, where `YMM_Hi128`
+is not; reading it there would produce sixteen plausible 128-bit
+numbers and no error at all.
+
+`gcore` does not produce a compacted area here, so that guard is
+unreachable with any core this suite can make, and a mutation
+deleting it survived. The case sets bit 63 of `xcomp_bv` in a copy of
+a real core instead.
+
+Six mutations, all caught: xmm read 16 bytes early, xmm halves
+swapped, x87 stride 10 instead of 16, mxcsr read from `fip`, the ymm
+upper half taken from xmm, and the compacted guard removed.
+
 ## What does not work
 
 - x86-64 little-endian Linux only. 32-bit cores, big-endian cores and
@@ -228,12 +269,19 @@ them. It is in `PLAN.md` as the first unchecked item.
   Real cores do not have them, and corex does not complain.
 - `-x` is the only way to read memory. There is no expression evaluator, no
   typed inspection, nothing that needs to know what a pointer points at.
+- ZMM, the opmask registers and the rest of AVX-512. `--notes`
+  lists `NT_X86_XSTATE` and its size; only `YMM_Hi128` is decoded.
+  Each further component needs its offset from the CPUID leaf the
+  producing machine had, and that is not in the core, so the standard
+  offsets would be an assumption rather than a fact.
+- The x87 tag word as gdb prints it. The note holds the abridged
+  8-bit form and that is what is printed, under its own name.
 
 ## `make test`
 
 ```
 $ make test
-72 passed, 0 failed, 0 skipped
+80 passed, 0 failed, 0 skipped
 ```
 
 Six cores from five programs, plus three synthesised fixtures. The suite

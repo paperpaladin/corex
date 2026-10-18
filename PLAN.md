@@ -121,10 +121,38 @@ Next, in order:
         PN_XNUM shapes are therefore synthesised, not observed. On a machine
         with root: `echo core > /proc/sys/kernel/core_pattern`, `ulimit -c
         unlimited`, and compare against the fixtures.
-- [ ] decode NT_FPREGSET and NT_X86_XSTATE
+- [x] decode NT_FPREGSET and NT_X86_XSTATE
       - why: `--notes` already lists them with their sizes, and gdb's `info
         all-registers` is sitting right there as the oracle for xmm/ymm. The
         x87 tag word and the XSAVE component offsets are the interesting part.
+      - done: `--fpregs`. Control words, the eight x87 slots as their
+        raw 80 bits, all sixteen xmm as 128-bit values, and ymm0..15
+        assembled from the xmm halves and YMM_Hi128. All compared
+        against gdb, all agreeing.
+      - The fixture is the point of the item, not the decoder. Every
+        other core here leaves xmm, the x87 stack and mxcsr at their
+        startup values, which are zero or constant, so a decoder
+        reading the wrong offset inside 512 bytes of zeros produces
+        exactly the right answer. `t/fpregs.c` sets all 25 of them to
+        distinct values, distinct in BOTH 64-bit halves, so an 8-byte
+        read fails too. The suite asserts that no more than two xmm
+        registers are zero and that mxcsr is not its default, because
+        a fixture that silently stopped setting them would put the
+        comparison back where it started.
+      - The abridged FXSAVE tag byte is printed as `ftag_abridged`,
+        not as `ftag`. gdb reconstructs the 16-bit x87 tag word from
+        it and prints that; the note holds the 8-bit form. Naming
+        both `ftag` would invite a comparison between two different
+        quantities.
+      - A compacted XSAVE area is declined rather than read at the
+        standard offset, where YMM_Hi128 is not. gcore does not
+        produce one here, so that guard is unreachable with any core
+        this suite can make and a mutation deleting it survived; the
+        case sets bit 63 of xcomp_bv in a copy instead.
+      - Six mutations, all caught: xmm read 16 bytes early, xmm halves
+        swapped, x87 stride 10 instead of 16, mxcsr read from fip, the
+        ymm upper half taken from xmm, and the compacted guard
+        removed.
 - [ ] a 32-bit (ELFCLASS32) core
       - why: currently rejected at the header, which is honest but narrow.
         `gcc -m32` plus a second `pr_reg` layout; the note format is identical,
